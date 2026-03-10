@@ -332,14 +332,14 @@ def knightMoves(square: int) -> int:
 
 
     moves = (
-        ((bb << 6) & notGfile & notHfile) |
-        ((bb << 10) & notAfile & notBfile) |
-        ((bb << 15) & notHfile) |
-        ((bb << 17) & notAfile) |
-        ((bb >> 6) & notGfile & notHfile) |
-        ((bb >> 10) & notAfile & notBfile) |
-        ((bb >> 15) & notHfile) |
-        ((bb >> 17) & notAfile)
+        ((bb & notAfile & notBfile) << 6) |
+        ((bb & notHfile & notGfile) << 10) |
+        ((bb & notAfile) << 15) |
+        ((bb & notHfile) << 17) |
+        ((bb & notGfile & notHfile) >> 6) |
+        ((bb & notAfile & notBfile) >> 10) |
+        ((bb & notHfile) >> 15) |
+        ((bb & notAfile) >> 17)
     )
 
     return moves
@@ -452,8 +452,8 @@ def getBishopMoves(bishopsBB: int, ownPieces: int, allPieces: int) -> list[Move]
     
     return moves
 
-def queenMoves(square: int, allPieces: int, ownPieces: int) -> int:
-    return rookMoves(square, allPieces, ownPieces) | bishopMoves(square, allPieces, ownPieces)
+def queenMoves(square: int,ownPieces: int, allPieces: int) -> int:
+    return rookMoves(square, ownPieces, allPieces) | bishopMoves(square, ownPieces, allPieces)
 
 def getQueenMoves(queensBB: int, ownPieces: int, allPieces: int) -> list[Move]:
 
@@ -582,13 +582,13 @@ def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, direc
 
     double = shift(bb & startRank, 16*s) &~ allPieces &~ shift(allPieces, 8*s)
 
-    captureLeft = shift(bb, 7*s) & notAfile & oppPieces
-    captureRight = shift(bb, 9*s) & notHfile & oppPieces
+    captureLeft = shift(bb & notAfile & oppPieces, 7*s)
+    captureRight = shift(bb & notHfile & oppPieces, 9*s)
 
     if enPassantSq >= 0:
         epBB        = 1 << enPassantSq
-        epLeft      = shift(bb, s * 7) & notHfile & epBB
-        epRight     = shift(bb, s * 9) & notAfile & epBB
+        epLeft      = shift(bb & notHfile, s * 7) & epBB
+        epRight     = shift(bb & notAfile, s * 9) & epBB
     else:
         epLeft = epRight = 0
 
@@ -667,16 +667,60 @@ def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
         1 1 1 1 1 1 1 0
     """)
     
-    captureLeft = shift(bb, 7*s) & notAfile
-    captureRight = shift(bb, 9*s) & notHfile
+    captureLeft = shift(bb & notAfile, 7*s) 
+    captureRight = shift(bb & notHfile, 9*s)
     if enPassantSq >= 0:
         epBB        = 1 << enPassantSq
-        epLeft      = shift(bb, s * 7) & notHfile & epBB
-        epRight     = shift(bb, s * 9) & notAfile & epBB
+        epLeft      = shift(bb & notHfile, s * 7) & epBB
+        epRight     = shift(bb & notAfile, s * 9) & epBB
     else:
         epLeft = epRight = 0
 
     return captureLeft | captureRight | epLeft | epRight
+
+
+
+notAfile = bb_from_string("""
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+    0 1 1 1 1 1 1 1
+""")
+notBfile = bb_from_string("""
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+    1 0 1 1 1 1 1 1
+""")
+notGfile = bb_from_string("""
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+    1 1 1 1 1 1 0 1
+""")
+notHfile = bb_from_string("""
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+    1 1 1 1 1 1 1 0
+""")
+
 
 
 if __name__ == "__main__":
@@ -684,4 +728,7 @@ if __name__ == "__main__":
 
     board = Board()
 
-    print(bb_to_string(board.getBlackPieces()))
+
+    #print(bb_to_string(board.getAttackedSq("white")))
+    print(bb_to_string(queenMoves(3, board.whitePieces, board.allPieces)))
+
