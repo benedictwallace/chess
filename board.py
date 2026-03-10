@@ -169,13 +169,13 @@ class Board:
         self.allPieces = self.getWhitePieces() | self.getBlackPieces()
         self.enPassantSq = -1
 
-    def getWhitePieces(self):
+    def getWhitePieces(self) -> int:
         return self.whitePawn | self.whiteBishop | self.whiteKnight | self.whiteRook | self.whiteQueen | self.whiteKing
 
-    def getBlackPieces(self):
+    def getBlackPieces(self) -> int:
         return self.blackPawn | self.blackBishop | self.blackKnight | self.blackRook | self.blackQueen | self.blackKing
     
-    def whiteMoves(self):
+    def whiteMoves(self) -> list[Move]:
         moves = []
         moves += getKnightMoves(self.whiteKnight, self.whitePieces)
         moves += getRookMoves(self.whiteRook, ownPieces=self.whitePieces, allPieces=self.allPieces)
@@ -185,7 +185,7 @@ class Board:
         moves += getPawnMoves(self.whitePawn, ownPieces=self.whitePieces, allPieces=self.allPieces, oppPieces=self.blackPieces, direction=1, enPassantSq=self.enPassantSq)
         return moves
 
-    def blackMoves(self):
+    def blackMoves(self) -> list[Move]:
         moves = []
         moves += getKnightMoves(self.blackKnight, self.blackPieces)
         moves += getRookMoves(self.blackRook, ownPieces=self.blackPieces, allPieces=self.allPieces)
@@ -199,6 +199,89 @@ class Board:
         self.whitePieces = self.getWhitePieces()
         self.blackPieces = self.getBlackPieces()
         self.allPieces = self.whitePieces | self.blackPieces
+
+    def getAttackedSq(self, colour: str) -> int:
+        """
+        colour: "white" or "black", for the colour of the attacker ("white" gives all of whites attacks).
+        """
+        attacked = 0
+        if colour == "black":
+
+            bb = self.blackKnight
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= knightMoves(fromSq)
+                bb &= bb - 1
+            
+            bb = self.blackBishop
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= bishopMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                bb &= bb - 1
+
+            bb = self.blackRook
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= rookMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                bb &= bb - 1
+            
+            bb = self.blackQueen
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= queenMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                bb &= bb - 1
+
+            bb = self.blackKing
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= kingMoves(fromSq, ownPieces=self.blackPieces)
+                bb &= bb - 1
+
+            bb = self.blackPawn
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= pawnAttacks(fromSq, direction=-1, enPassantSq=self.enPassantSq)
+                bb &= bb - 1           
+        else:
+            bb = self.whiteKnight
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= knightMoves(fromSq)
+                bb &= bb - 1
+            
+            bb = self.whiteBishop
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= bishopMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                bb &= bb - 1
+
+            bb = self.whiteRook
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= rookMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                bb &= bb - 1
+            
+            bb = self.whiteQueen
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= queenMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                bb &= bb - 1
+
+            bb = self.whiteKing
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= kingMoves(fromSq, ownPieces=self.whitePieces)
+                bb &= bb - 1
+
+            bb = self.whitePawn
+            while bb:
+                fromSq = lsb(bb)
+                attacked |= pawnAttacks(fromSq, direction=1, enPassantSq=self.enPassantSq)
+                bb &= bb - 1     
+        
+        return attacked
+
+
 
 def knightMoves(square: int) -> int:
     # Square index number not bb
@@ -555,6 +638,45 @@ def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, d
     
     return moves
 
+def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
+    bb = 1 << square
+
+    def shift(bb, n):
+        return bb << n if n > 0 else bb >> -n
+    
+    s = direction
+
+    notAfile = bb_from_string("""
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+        0 1 1 1 1 1 1 1
+    """)
+    notHfile = bb_from_string("""
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+        1 1 1 1 1 1 1 0
+    """)
+    
+    captureLeft = shift(bb, 7*s) & notAfile
+    captureRight = shift(bb, 9*s) & notHfile
+    if enPassantSq >= 0:
+        epBB        = 1 << enPassantSq
+        epLeft      = shift(bb, s * 7) & notHfile & epBB
+        epRight     = shift(bb, s * 9) & notAfile & epBB
+    else:
+        epLeft = epRight = 0
+
+    return captureLeft | captureRight | epLeft | epRight
 
 
 if __name__ == "__main__":
