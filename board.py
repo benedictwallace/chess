@@ -217,25 +217,25 @@ class Board:
             bb = self.blackBishop
             while bb:
                 fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
 
             bb = self.blackRook
             while bb:
                 fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
             
             bb = self.blackQueen
             while bb:
                 fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=self.blackPieces, allPieces=self.allPieces)
+                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
 
             bb = self.blackKing
             while bb:
                 fromSq = lsb(bb)
-                attacked |= kingMoves(fromSq, ownPieces=self.blackPieces, attacksBB=0)
+                attacked |= kingMoves(fromSq, ownPieces=0, attacksBB=0)
                 bb &= bb - 1
 
             bb = self.blackPawn
@@ -253,25 +253,25 @@ class Board:
             bb = self.whiteBishop
             while bb:
                 fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
 
             bb = self.whiteRook
             while bb:
                 fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
             
             bb = self.whiteQueen
             while bb:
                 fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=self.whitePieces, allPieces=self.allPieces)
+                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
                 bb &= bb - 1
 
             bb = self.whiteKing
             while bb:
                 fromSq = lsb(bb)
-                attacked |= kingMoves(fromSq, ownPieces=self.whitePieces, attacksBB=0)
+                attacked |= kingMoves(fromSq, ownPieces=0, attacksBB=0)
                 bb &= bb - 1
 
             bb = self.whitePawn
@@ -281,7 +281,7 @@ class Board:
                 bb &= bb - 1     
         
         return attacked
- 
+
 
 
 def knightMoves(square: int) -> int:
@@ -583,18 +583,22 @@ def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, direc
 
     double = shift(bb & startRank, 16*s) &~ allPieces &~ shift(allPieces, 8*s)
 
+    # Flipped left and right for black
     if direction == 1:
-        captureLeft = shift(bb & notAfile, 7*s) & oppPieces
-        captureRight = shift(bb & notHfile, 9*s) & oppPieces
+        left = 7*direction
+        right = 9*direction
     else:
-        # Flipped left and right for black
-        captureLeft = shift(bb & notAfile, 9*s) & oppPieces
-        captureRight = shift(bb & notHfile, 7*s) & oppPieces
+        left = 9*direction
+        right = 7*direction
+
+    captureLeft = shift(bb & notAfile, left) & oppPieces
+    captureRight = shift(bb & notHfile, right) & oppPieces
+
 
     if enPassantSq >= 0:
         epBB        = 1 << enPassantSq
-        epLeft      = shift(bb & notHfile, s * 7) & epBB
-        epRight     = shift(bb & notAfile, s * 9) & epBB
+        epLeft      = shift(bb & notAfile, left) & epBB
+        epRight     = shift(bb & notHfile, right) & epBB
     else:
         epLeft = epRight = 0
 
@@ -649,8 +653,6 @@ def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
 
     def shift(bb, n):
         return bb << n if n > 0 else bb >> -n
-    
-    s = direction
 
     notAfile = bb_from_string("""
         0 1 1 1 1 1 1 1
@@ -673,18 +675,22 @@ def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
         1 1 1 1 1 1 1 0
     """)
     
+    
+    # Flipped left and right for black
     if direction == 1:
-        captureLeft = shift(bb & notAfile, 7*s) 
-        captureRight = shift(bb & notHfile, 9*s)
+        left = 7*direction
+        right = 9*direction
     else:
-        # Flipped left and right for black
-        captureLeft = shift(bb & notAfile, 9*s) 
-        captureRight = shift(bb & notHfile, 7*s)
+        left = 9*direction
+        right = 7*direction
+    
+    captureLeft = shift(bb & notAfile, left) 
+    captureRight = shift(bb & notHfile, right)
 
     if enPassantSq >= 0:
         epBB        = 1 << enPassantSq
-        epLeft      = shift(bb & notHfile, s * 7) & epBB
-        epRight     = shift(bb & notAfile, s * 9) & epBB
+        epLeft      = shift(bb & notAfile, left) & epBB
+        epRight     = shift(bb & notHfile, right) & epBB
     else:
         epLeft = epRight = 0
 
@@ -740,17 +746,18 @@ if __name__ == "__main__":
 
     board = Board()
 
+    # Square 46
     pos = bb_from_string("""
+                0 0 0 0 0 0 0 0 
+                0 0 0 0 0 0 0 0
+                0 0 0 0 0 0 1 0
                 0 0 0 0 0 0 0 0
                 0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                0 0 0 1 0 0 0 0
                 0 0 0 0 0 0 0 0
                 0 0 0 0 0 0 0 0
                 0 0 0 0 0 0 0 0
                    """)
-    print(bb_to_string(board.getBlackPieces()))
-    print(bb_to_string(board.getAttackedSq("black")))
-    print(bb_to_string(kingMoves(54, board.whitePieces, board.getAttackedSq("black"))))
+
+
+    print(bb_to_string(pawnAttacks(47, -1, board.enPassantSq)))
 
