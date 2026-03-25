@@ -102,6 +102,9 @@ class Board:
     0 0 0 0 0 0 0 0
     0 0 0 0 1 0 0 0
 """)
+        # track rook/king moves from start sq.
+        self.whiteKCastle = True
+        self.whiteQCastle = True
         self.whitePieces = self.getWhitePieces()
 
         self.blackPawn = bb_from_string("""
@@ -164,9 +167,12 @@ class Board:
     0 0 0 0 0 0 0 0
     0 0 0 0 0 0 0 0
 """)
+        # track rook/king moves from start sq.
+        self.blackKCastle = True
+        self.blackQCastle = True
         self.blackPieces = self.getBlackPieces()
 
-        self.allPieces = self.getWhitePieces() | self.getBlackPieces()
+        self.allPieces = self.blackPieces | self.whitePieces
         self.enPassantSq = -1
 
     def getWhitePieces(self) -> int:
@@ -183,6 +189,7 @@ class Board:
         moves += getQueenMoves(self.whiteQueen, ownPieces=self.whitePieces, allPieces=self.allPieces)
         moves += getKingMoves(self.whiteKing, ownPieces=self.whitePieces, attackBB=self.getAttackedSq("black"))
         moves += getPawnMoves(self.whitePawn, ownPieces=self.whitePieces, allPieces=self.allPieces, oppPieces=self.blackPieces, direction=1, enPassantSq=self.enPassantSq)
+        moves += self.getCastles(colour="white", attacksBB=self.getAttackedSq("black"))
         return moves
 
     def blackMoves(self) -> list[Move]:
@@ -193,6 +200,7 @@ class Board:
         moves += getQueenMoves(self.blackQueen, ownPieces=self.blackPieces, allPieces=self.allPieces)
         moves += getKingMoves(self.blackKing, ownPieces=self.blackPieces, attackBB=self.getAttackedSq("white"))
         moves += getPawnMoves(self.blackPawn, ownPieces=self.blackPieces, allPieces=self.allPieces, oppPieces=self.whitePieces, direction=-1, enPassantSq=self.enPassantSq)
+        moves += self.getCastles(colour="black", attacksBB=self.getAttackedSq("white"))
         return moves
     
     def updatePieces(self):
@@ -207,6 +215,8 @@ class Board:
         """
         attacked = 0
         if colour == "black":
+            # Remove king to allow attacked spaces behind king to be added.
+            allPiecesNoKing = self.allPieces & ~self.whiteKing
 
             bb = self.blackKnight
             while bb:
@@ -217,19 +227,19 @@ class Board:
             bb = self.blackBishop
             while bb:
                 fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
 
             bb = self.blackRook
             while bb:
                 fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
             
             bb = self.blackQueen
             while bb:
                 fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
 
             bb = self.blackKing
@@ -244,6 +254,9 @@ class Board:
                 attacked |= pawnAttacks(fromSq, direction=-1, enPassantSq=self.enPassantSq)
                 bb &= bb - 1           
         else:
+            # Remove king to allow attacked spaces behind king to be added.
+            allPiecesNoKing = self.allPieces & ~self.blackKing
+
             bb = self.whiteKnight
             while bb:
                 fromSq = lsb(bb)
@@ -253,19 +266,19 @@ class Board:
             bb = self.whiteBishop
             while bb:
                 fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
 
             bb = self.whiteRook
             while bb:
                 fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
             
             bb = self.whiteQueen
             while bb:
                 fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=self.allPieces)
+                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
                 bb &= bb - 1
 
             bb = self.whiteKing
@@ -282,7 +295,110 @@ class Board:
         
         return attacked
 
+    def getCastles(self, colour: str, attacksBB) -> list[Move]:
+        moves = []
 
+
+        if colour == "white":
+            
+            mustBeEmptyKwhite = bb_from_string("""
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 1 1 0
+            """) 
+            cantBeAttackedKwhite = bb_from_string("""
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 1 1 1 0
+            """)         
+            mustBeEmptyQwhite = bb_from_string("""
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 1 1 1 0 0 0 0
+            """) 
+            cantBeAttackedQwhite = bb_from_string("""
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 1 1 1 0 0 0
+            """)      
+            
+            
+            if self.whiteKCastle and not (self.allPieces & mustBeEmptyKwhite) and not (attacksBB & cantBeAttackedKwhite):
+                moves.append(Move(fromSq = 4, toSq = 6, castle = True))
+
+            if self.whiteQCastle and not (self.allPieces & mustBeEmptyQwhite) and not (attacksBB & cantBeAttackedQwhite):
+                moves.append(Move(fromSq = 4, toSq = 2, castle = True))
+
+        else:
+            
+            mustBeEmptyKblack = bb_from_string("""
+                                           0 0 0 0 0 1 1 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+            """) 
+            cantBeAttackedKblack = bb_from_string("""
+                                           0 0 0 0 1 1 1 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+            """)         
+            mustBeEmptyQblack = bb_from_string("""
+                                           0 1 1 1 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+            """) 
+            cantBeAttackedQblack = bb_from_string("""
+                                           0 0 1 1 1 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0
+            """)
+            
+            if self.blackKCastle and not (self.allPieces & mustBeEmptyKblack) and not (attacksBB & cantBeAttackedKblack):
+                moves.append(Move(fromSq = 4, toSq = 6, castle = True))
+
+            if self.whiteQCastle and not (self.allPieces & mustBeEmptyQblack) and not (attacksBB & cantBeAttackedQblack):
+                moves.append(Move(fromSq = 4, toSq = 2, castle = True))
+
+        return moves
 
 def knightMoves(square: int) -> int:
     # Square index number not bb
@@ -525,7 +641,7 @@ def getKingMoves(kingsBB: int, ownPieces: int, attackBB: int) -> list[Move]:
         
         # Removes lsb
         kingsBB &= kingsBB - 1
-    
+
     return moves
 
 def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, direction: int, enPassantSq: int) -> int:
@@ -641,7 +757,7 @@ def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, d
                 for piece in ['Q', 'R', 'B', 'N']:
                     moves.append(Move(fromSq = fromSq, toSq = toSq, promotion=piece))
             else:
-                moves.append(Move(fromSq = fromSq, toSq = toSq))
+                moves.append(Move(fromSq = fromSq, toSq = toSq, enPassant=isEn))
             attacks &= attacks - 1
     
         pawnsBB &= pawnsBB - 1
@@ -698,6 +814,8 @@ def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
 
 
 
+
+
 notAfile = bb_from_string("""
     0 1 1 1 1 1 1 1
     0 1 1 1 1 1 1 1
@@ -744,20 +862,46 @@ notHfile = bb_from_string("""
 if __name__ == "__main__":
     assert bb_from_string(bb_to_string(1)) == 1
 
+    # Clear the board
     board = Board()
+    board.whitePawn = 0
+    board.whiteBishop = 0
+    board.whiteKnight = 0
+    board.whiteRook = 0
+    board.whiteQueen = 0
+    board.blackPawn = 0
+    board.blackBishop = 0
+    board.blackKnight = 0
+    board.blackRook = 0
+    board.blackQueen = 0
 
-    # Square 46
-    pos = bb_from_string("""
-                0 0 0 0 0 0 0 0 
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 1 0
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                0 0 0 0 0 0 0 0
-                   """)
+    # White king on e1 (sq 4), black rook on e5 (sq 36)
+    board.whiteKing = bb_from_string("""
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 1 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+    """)
+    board.blackRook = bb_from_string("""
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 1 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+        0 0 0 0 0 0 0 0
+    """)
+    board.updatePieces()
 
+    moves = board.whiteMoves()
+    king_moves = [m for m in moves]
+    king_destinations = [m.toSq for m in king_moves]
+    print(king_moves)
+    print(king_destinations)
 
-    print(bb_to_string(pawnAttacks(47, -1, board.enPassantSq)))
 
