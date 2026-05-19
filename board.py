@@ -154,6 +154,7 @@ class Board:
 
         self.allPieces = self.blackPieces | self.whitePieces
         self.enPassantSq = -1
+        self.sideToMove = "white"
 
     def getWhitePieces(self) -> int:
         result = 0
@@ -297,7 +298,6 @@ class Board:
                 return key
         return None
     
-
     def makeMove(self, move):
         fromBB = 1 << move.fromSq
         toBB = 1 << move.toSq
@@ -369,8 +369,20 @@ class Board:
 
         # update pieces
         self.updatePieces()
+        
+        self.sideToMove = "black" if self.sideToMove == "white" else "white"
 
-
+    def checkMate(self, colour: str) -> bool:
+        """
+        Is colour in checkmate?
+        """
+        return self.inCheck(colour) and not self.legalMoves(colour)
+    
+    def staleMate(self, colour: str) -> bool:
+        """
+        Is colour in stalemate?
+        """
+        return not self.inCheck(colour) and not self.legalMoves(colour)
 
 def perft(board, colour, depth):
     if depth == 0:
