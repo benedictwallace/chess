@@ -1,6 +1,7 @@
+import copy
 
 from bitboard import (
-    bb_from_string, bb_to_string, lsb, 
+    bb_from_string, bb_to_string, lsb,
     mustBeEmptyKwhite, mustBeEmptyQwhite, 
     cantBeAttackedKwhite, cantBeAttackedQwhite, 
     mustBeEmptyKblack, cantBeAttackedKblack,
@@ -274,68 +275,120 @@ class Board:
         else:
             return bool(self.bb["black", "king"] & self.getAttackedSq("white"))
         
-    def legalMoves(self, colour: str) -> int:
-        # return the list of legal moves, e.g. moves not leading to check.
-        pass
+    def legalMoves(self, colour: str) -> list[Move]:
+        """
+        Return moves that don't leave our own king in check.
 
+        """
+        pseudo = self.getMoves(colour)
+        legal = []
+        for move in pseudo:
+            trial = copy.deepcopy(self)
+            trial.makeMove(move)
+            if not trial.inCheck(colour):
+                legal.append(move)
+        return legal
+
+    def pieceAt(self, square: Move) -> tuple[str]:
+        bit = 1 << square
+
+        for key, bb in self.bb.items():
+            if bit & bb:
+                return key
+        return None
+    
 
     def makeMove(self, move):
+        fromBB = 1 << move.fromSq
+        toBB = 1 << move.toSq
 
-        # find which piece it is
-        if (self.whitePawn >> move.fromSq) & 1:
-            pass
+        # find which piece is moving
+        mover = self.pieceAt(move.fromSq)
+        if mover is None:
+            raise ValueError(f"makeMove: no piece on fromSq={move.fromSq}")
         
+        colour, piece = mover
+        oppColour = "black" if colour == "white" else "white"
+        
+        # find if move takes
+        taken = self.pieceAt(move.toSq)
+
+        # move mover
+        self.bb[mover] &= ~fromBB
+        self.bb[mover] |= toBB
+
+        # take piece
+        if taken is not None:
+            self.bb[taken] &= ~toBB
+        
+        # promotion
+        if move.promotion is not None:
+            promoMap = {"Q": "queen", "R": "rook", "B": "bishop", "N": "knight"}
+            promoted = promoMap[move.promotion]
+            self.bb[colour, "pawn"] &= ~toBB # remove the pawn
+            self.bb[colour, promoted] |= toBB # add the promoted piece
+
+        # castling
+        if move.castle:
+            if move.toSq == 6: # white kingside
+                self.bb[colour, "rook"] &= ~(1 << 7)
+                self.bb[colour, "rook"] |= (1 << 5)
+            elif move.toSq == 2: # white queenside
+                self.bb[colour, "rook"] &= ~(1 << 0)
+                self.bb[colour, "rook"] |= (1 << 3)
+            elif move.toSq == 62: # black kingside
+                self.bb[colour, "rook"] &= ~(1 << 63)
+                self.bb[colour, "rook"] |= (1 << 61)
+            elif move.toSq == 58: # black queenside
+                self.bb[colour, "rook"] &= ~(1 << 56)
+                self.bb[colour, "rook"] |= (1 << 59)
+
+        # enpassant
+        if move.enPassant:
+            capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
+            self.bb[oppColour, "pawn"] &= ~(1 << capturedSq)
+
+        # update enpensantsq + castling rights
+        if piece == "pawn" and abs(move.toSq - move.fromSq) == 16:
+            self.enPassantSq = (move.fromSq + move.toSq) // 2
+        else:
+            self.enPassantSq = -1
+
+        if move.fromSq == 4 or move.toSq == 4:
+            self.whiteKCastle = self.whiteQCastle = False
+        if move.fromSq == 60 or move.toSq == 60:
+            self.blackKCastle = self.blackQCastle = False
+        if move.fromSq == 0 or move.toSq == 0:
+            self.whiteQCastle = False
+        if move.fromSq == 7 or move.toSq == 7:
+            self.whiteKCastle = False
+        if move.fromSq == 56 or move.toSq == 56:
+            self.blackQCastle = False
+        if move.fromSq == 63 or move.toSq == 63:
+            self.blackKCastle = False
+
+        # update pieces
+        self.updatePieces()
 
 
-        # adjust that bit board
-        # remove a piece if it's on that square
 
-
+def perft(board, colour, depth):
+    if depth == 0:
+        return 1
+    total = 0
+    for move in board.legalMoves(colour):
+        trial = copy.deepcopy(board)
+        trial.makeMove(move)
+        next_colour = "black" if colour == "white" else "white"
+        total += perft(trial, next_colour, depth - 1)
+    return total
 
 
 if __name__ == "__main__":
     assert bb_from_string(bb_to_string(1)) == 1
 
-    # Clear the board
-    board = Board()
-    board.whitePawn = 0
-    board.whiteBishop = 0
-    board.whiteKnight = 0
-    board.whiteRook = 0
-    board.whiteQueen = 0
-    board.blackPawn = 0
-    board.blackBishop = 0
-    board.blackKnight = 0
-    board.blackRook = 0
-    board.blackQueen = 0
-
-    # White king on e1 (sq 4), black rook on e5 (sq 36)
-    board.whiteKing = bb_from_string("""
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 1 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-    """)
-    board.blackRook = bb_from_string("""
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 1 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-        0 0 0 0 0 0 0 0
-    """)
-    board.updatePieces()
-
-    moves = board.whiteMoves()
-    king_moves = [m for m in moves]
-    king_destinations = [m.toSq for m in king_moves]
-    print(king_moves)
-    print(king_destinations)
-
-
+    b = Board()
+    print(perft(b, "white", 1))
+    print(perft(b, "white", 2))
+    print(perft(b, "white", 3))
+    print(perft(b, "white", 4))

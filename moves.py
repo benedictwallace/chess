@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from bitboard import lsb, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
+from bitboard import lsb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
 
 @dataclass
 class Move:
@@ -27,7 +27,7 @@ def knightMoves(square: int) -> int:
         ((bb & notAfile) >> 17)
     )
 
-    return moves
+    return moves & BOARD
 
 def getKnightMoves(knightsBB: int, ownPieces: int) -> list[Move]:
     moves = []
@@ -171,7 +171,7 @@ def kingMoves(square: int, ownPieces: int, attacksBB: int) -> int:
         ((bb >> 9) & notHfile)
     )
 
-    return moves & ~ownPieces & ~attacksBB
+    return moves & ~ownPieces & ~attacksBB & BOARD
 
 def getKingMoves(kingsBB: int, ownPieces: int, attackBB: int) -> list[Move]:
     """
@@ -234,7 +234,7 @@ def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, colou
     else:
         epLeft = epRight = 0
 
-    return single | double | captureLeft | captureRight | epLeft | epRight
+    return (single | double | captureLeft | captureRight | epLeft | epRight) & BOARD
 
 def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, colour: str, enPassantSq: int) -> list[Move]:
     moves = []
@@ -286,6 +286,6 @@ def pawnAttacks(square: int, colour: str, enPassantSq: int) -> int:
     else:
         epLeft = epRight = 0
 
-    return captureLeft | captureRight | epLeft | epRight
+    return (captureLeft | captureRight | epLeft | epRight) & BOARD
 
 

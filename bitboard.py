@@ -24,6 +24,7 @@ def lsb(bb: int) -> int:
     # lowest set bit, returns the index of the first piece
     return (bb & -bb).bit_length() - 1
 
+BOARD = (1 << 64) - 1
 
 notAfile = bb_from_string("""
     0 1 1 1 1 1 1 1
@@ -157,7 +158,6 @@ cantBeAttackedQblack = bb_from_string("""
                                 0 0 0 0 0 0 0 0
 """)
 
-            
 mustBeEmptyKwhite = bb_from_string("""
                                 0 0 0 0 0 0 0 0
                                 0 0 0 0 0 0 0 0
@@ -201,5 +201,5 @@ cantBeAttackedQwhite = bb_from_string("""
                                 0 0 0 0 0 0 0 0
                                 0 0 1 1 1 0 0 0
 """)      
-            
+
 
