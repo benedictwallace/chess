@@ -1,5 +1,11 @@
 
-from bitboard import bb_from_string, bb_to_string, lsb
+from bitboard import (
+    bb_from_string, bb_to_string, lsb, 
+    mustBeEmptyKwhite, mustBeEmptyQwhite, 
+    cantBeAttackedKwhite, cantBeAttackedQwhite, 
+    mustBeEmptyKblack, cantBeAttackedKblack,
+    mustBeEmptyQblack, cantBeAttackedQblack,
+)
 from moves import (
     Move,
     knightMoves, getKnightMoves,
@@ -13,131 +19,133 @@ from moves import (
 
 class Board:
     def __init__(self):
-        self.whitePawn = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    1 1 1 1 1 1 1 1
-    0 0 0 0 0 0 0 0
-""")
-        self.whiteBishop = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 1 0 0 1 0 0
-""")
-        self.whiteKnight = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 1 0 0 0 0 1 0
-""")
-        self.whiteRook = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    1 0 0 0 0 0 0 1
-""")
-        self.whiteQueen = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 1 0 0 0 0
-""")
-        self.whiteKing = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 1 0 0 0
-""")
+        self.bb = {
+            ('white', 'pawn') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                1 1 1 1 1 1 1 1
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('white', 'bishop') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 1 0 0 1 0 0
+                                            """),
+            ('white', 'knight') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 1 0 0 0 0 1 0
+                                            """),
+            ('white', 'rook') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                1 0 0 0 0 0 0 1
+                                            """),
+            ('white', 'queen') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 1 0 0 0 0
+                                            """),
+            ('white', 'king') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 1 0 0 0
+                                            """),
+            ('black', 'pawn') : bb_from_string("""
+                                                0 0 0 0 0 0 0 0
+                                                1 1 1 1 1 1 1 1
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('black', 'bishop') : bb_from_string("""
+                                                0 0 1 0 0 1 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('black', 'knight') : bb_from_string("""
+                                                0 1 0 0 0 0 1 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('black', 'rook') : bb_from_string("""
+                                                1 0 0 0 0 0 0 1
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('black', 'queen') : bb_from_string("""
+                                                0 0 0 1 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """),
+            ('black', 'king') : bb_from_string("""
+                                                0 0 0 0 1 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                                0 0 0 0 0 0 0 0
+                                            """)
+        }
         # track rook/king moves from start sq.
         self.whiteKCastle = True
         self.whiteQCastle = True
         self.whitePieces = self.getWhitePieces()
 
-        self.blackPawn = bb_from_string("""
-    0 0 0 0 0 0 0 0
-    1 1 1 1 1 1 1 1
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
-        self.blackBishop = bb_from_string("""
-    0 0 1 0 0 1 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
-        self.blackKnight = bb_from_string("""
-    0 1 0 0 0 0 1 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
-        self.blackRook = bb_from_string("""
-    1 0 0 0 0 0 0 1
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
-        self.blackQueen = bb_from_string("""
-    0 0 0 1 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
-        self.blackKing = bb_from_string("""
-    0 0 0 0 1 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-    0 0 0 0 0 0 0 0
-""")
         # track rook/king moves from start sq.
         self.blackKCastle = True
         self.blackQCastle = True
@@ -147,31 +155,40 @@ class Board:
         self.enPassantSq = -1
 
     def getWhitePieces(self) -> int:
-        return self.whitePawn | self.whiteBishop | self.whiteKnight | self.whiteRook | self.whiteQueen | self.whiteKing
+        result = 0
+        for (colour, _), bb in self.bb.items():
+            if colour == "white":
+                result |= bb
+        return result
 
     def getBlackPieces(self) -> int:
-        return self.blackPawn | self.blackBishop | self.blackKnight | self.blackRook | self.blackQueen | self.blackKing
+        result = 0
+        for (colour, _), bb in self.bb.items():
+            if colour == "black":
+                result |= bb
+        return result
     
-    def whiteMoves(self) -> list[Move]:
-        moves = []
-        moves += getKnightMoves(self.whiteKnight, self.whitePieces)
-        moves += getRookMoves(self.whiteRook, ownPieces=self.whitePieces, allPieces=self.allPieces)
-        moves += getBishopMoves(self.whiteBishop, ownPieces=self.whitePieces, allPieces=self.allPieces)
-        moves += getQueenMoves(self.whiteQueen, ownPieces=self.whitePieces, allPieces=self.allPieces)
-        moves += getKingMoves(self.whiteKing, ownPieces=self.whitePieces, attackBB=self.getAttackedSq("black"))
-        moves += getPawnMoves(self.whitePawn, ownPieces=self.whitePieces, allPieces=self.allPieces, oppPieces=self.blackPieces, direction=1, enPassantSq=self.enPassantSq)
-        moves += self.getCastles(colour="white", attacksBB=self.getAttackedSq("black"))
-        return moves
+    def getMoves(self, colour: str) -> list[Move]:
+        if colour == "white":
+            ownPieces = self.whitePieces
+            oppPieces = self.blackPieces
+            
+            oppColour = "black"
+        else:
+            ownPieces = self.blackPieces
+            oppPieces = self.whitePieces
+            
+            oppColour = "white"
 
-    def blackMoves(self) -> list[Move]:
+        oppAttacks = self.getAttackedSq(oppColour)
         moves = []
-        moves += getKnightMoves(self.blackKnight, self.blackPieces)
-        moves += getRookMoves(self.blackRook, ownPieces=self.blackPieces, allPieces=self.allPieces)
-        moves += getBishopMoves(self.blackBishop, ownPieces=self.blackPieces, allPieces=self.allPieces)
-        moves += getQueenMoves(self.blackQueen, ownPieces=self.blackPieces, allPieces=self.allPieces)
-        moves += getKingMoves(self.blackKing, ownPieces=self.blackPieces, attackBB=self.getAttackedSq("white"))
-        moves += getPawnMoves(self.blackPawn, ownPieces=self.blackPieces, allPieces=self.allPieces, oppPieces=self.whitePieces, direction=-1, enPassantSq=self.enPassantSq)
-        moves += self.getCastles(colour="black", attacksBB=self.getAttackedSq("white"))
+        moves += getKnightMoves(self.bb[colour, "knight"], ownPieces)
+        moves += getRookMoves(self.bb[colour, "rook"], ownPieces=ownPieces, allPieces=self.allPieces)
+        moves += getBishopMoves(self.bb[colour, "bishop"], ownPieces=ownPieces, allPieces=self.allPieces)
+        moves += getQueenMoves(self.bb[colour, "queen"], ownPieces=ownPieces, allPieces=self.allPieces)
+        moves += getKingMoves(self.bb[colour, "king"], ownPieces=ownPieces, attackBB=oppAttacks)
+        moves += getPawnMoves(self.bb[colour, "pawn"], ownPieces=ownPieces, allPieces=self.allPieces, oppPieces=oppPieces, colour=colour, enPassantSq=self.enPassantSq)
+        moves += self.getCastles(colour=colour, attacksBB=oppAttacks)
         return moves
     
     def updatePieces(self):
@@ -184,85 +201,48 @@ class Board:
         colour: "white" or "black", for the colour of the attacker ("white" gives all of whites attacks).
             kingMoves is passed attackBB as 0 since we need to know king surrounding squares.
         """
+
         attacked = 0
-        if colour == "black":
-            # Remove king to allow attacked spaces behind king to be added.
-            allPiecesNoKing = self.allPieces & ~self.whiteKing
 
-            bb = self.blackKnight
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= knightMoves(fromSq)
-                bb &= bb - 1
-            
-            bb = self.blackBishop
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
+        oppColour = "black" if colour == "white" else "white"
+        # Remove king to allow attacked spaces behind king to be added.
+        allPiecesNoKing = self.allPieces & ~self.bb[oppColour, "king"]
 
-            bb = self.blackRook
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
-            
-            bb = self.blackQueen
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
+        bb = self.bb[colour, "knight"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= knightMoves(fromSq)
+            bb &= bb - 1
+        
+        bb = self.bb[colour, "bishop"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
+            bb &= bb - 1
 
-            bb = self.blackKing
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= kingMoves(fromSq, ownPieces=0, attacksBB=0)
-                bb &= bb - 1
+        bb = self.bb[colour, "rook"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= rookMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
+            bb &= bb - 1
+        
+        bb = self.bb[colour, "queen"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= queenMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
+            bb &= bb - 1
 
-            bb = self.blackPawn
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= pawnAttacks(fromSq, direction=-1, enPassantSq=self.enPassantSq)
-                bb &= bb - 1           
-        else:
-            # Remove king to allow attacked spaces behind king to be added.
-            allPiecesNoKing = self.allPieces & ~self.blackKing
+        bb = self.bb[colour, "king"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= kingMoves(fromSq, ownPieces=0, attacksBB=0)
+            bb &= bb - 1
 
-            bb = self.whiteKnight
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= knightMoves(fromSq)
-                bb &= bb - 1
-            
-            bb = self.whiteBishop
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= bishopMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
-
-            bb = self.whiteRook
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= rookMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
-            
-            bb = self.whiteQueen
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= queenMoves(fromSq, ownPieces=0, allPieces=allPiecesNoKing)
-                bb &= bb - 1
-
-            bb = self.whiteKing
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= kingMoves(fromSq, ownPieces=0, attacksBB=0)
-                bb &= bb - 1
-
-            bb = self.whitePawn
-            while bb:
-                fromSq = lsb(bb)
-                attacked |= pawnAttacks(fromSq, direction=1, enPassantSq=self.enPassantSq)
-                bb &= bb - 1     
+        bb = self.bb[colour, "pawn"]
+        while bb:
+            fromSq = lsb(bb)
+            attacked |= pawnAttacks(fromSq, colour=colour, enPassantSq=self.enPassantSq)
+            bb &= bb - 1           
         
         return attacked
 
@@ -271,49 +251,7 @@ class Board:
 
 
         if colour == "white":
-            
-            mustBeEmptyKwhite = bb_from_string("""
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 1 1 0
-            """) 
-            cantBeAttackedKwhite = bb_from_string("""
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 1 1 1 0
-            """)         
-            mustBeEmptyQwhite = bb_from_string("""
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 1 1 1 0 0 0 0
-            """) 
-            cantBeAttackedQwhite = bb_from_string("""
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 1 1 1 0 0 0
-            """)      
-            
-            
+
             if self.whiteKCastle and not (self.allPieces & mustBeEmptyKwhite) and not (attacksBB & cantBeAttackedKwhite):
                 moves.append(Move(fromSq = 4, toSq = 6, castle = True))
 
@@ -321,61 +259,32 @@ class Board:
                 moves.append(Move(fromSq = 4, toSq = 2, castle = True))
 
         else:
-            
-            mustBeEmptyKblack = bb_from_string("""
-                                           0 0 0 0 0 1 1 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-            """) 
-            cantBeAttackedKblack = bb_from_string("""
-                                           0 0 0 0 1 1 1 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-            """)         
-            mustBeEmptyQblack = bb_from_string("""
-                                           0 1 1 1 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-            """) 
-            cantBeAttackedQblack = bb_from_string("""
-                                           0 0 1 1 1 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-                                           0 0 0 0 0 0 0 0
-            """)
-            
+
             if self.blackKCastle and not (self.allPieces & mustBeEmptyKblack) and not (attacksBB & cantBeAttackedKblack):
-                moves.append(Move(fromSq = 4, toSq = 6, castle = True))
+                moves.append(Move(fromSq = 60, toSq = 62, castle = True))
 
             if self.blackQCastle and not (self.allPieces & mustBeEmptyQblack) and not (attacksBB & cantBeAttackedQblack):
-                moves.append(Move(fromSq = 4, toSq = 2, castle = True))
+                moves.append(Move(fromSq = 60, toSq = 58, castle = True))
 
         return moves
+
+    def inCheck(self, colour: str) -> bool:
+        if colour == "white":
+            return bool(self.bb["white", "king"] & self.getAttackedSq("black"))
+        else:
+            return bool(self.bb["black", "king"] & self.getAttackedSq("white"))
+        
+    def legalMoves(self, colour: str) -> int:
+        # return the list of legal moves, e.g. moves not leading to check.
+        pass
+
 
     def makeMove(self, move):
 
         # find which piece it is
         if (self.whitePawn >> move.fromSq) & 1:
             pass
+        
 
 
         # adjust that bit board

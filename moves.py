@@ -11,10 +11,6 @@ class Move:
     castle: bool = False
     enPassant: bool = False
 
-
-
-
-
 def knightMoves(square: int) -> int:
     # Square index number not bb
     # Grid numbers 0 to 63
@@ -178,6 +174,12 @@ def kingMoves(square: int, ownPieces: int, attacksBB: int) -> int:
     return moves & ~ownPieces & ~attacksBB
 
 def getKingMoves(kingsBB: int, ownPieces: int, attackBB: int) -> list[Move]:
+    """
+    args:
+        kingsBB: bitboard of king pieces.
+        ownPieces: bitboard of either colours pieces, depending on which king.
+        attackBB: bitboard of opposition attacks, removes these moves from possible moves to prevent moving into check.
+    """
     moves = []
 
     while kingsBB:
@@ -195,27 +197,31 @@ def getKingMoves(kingsBB: int, ownPieces: int, attackBB: int) -> list[Move]:
 
     return moves
 
-def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, direction: int, enPassantSq: int) -> int:
+def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, colour: str, enPassantSq: int) -> int:
     # direction 1 for white -1 for black
     bb = 1 << square
 
     def shift(bb, n):
         return bb << n if n > 0 else bb >> -n
-    
-    s = direction
-    startRank = rank2 if direction == 1 else rank7
+
+    if colour == "white":
+        startRank = rank2
+        s = 1
+    else:
+        startRank = rank7
+        s = -1
 
     single = shift(bb, 8*s) &~ allPieces
 
     double = shift(bb & startRank, 16*s) &~ allPieces &~ shift(allPieces, 8*s)
 
     # Flipped left and right for black
-    if direction == 1:
-        left = 7*direction
-        right = 9*direction
+    if colour == "white":
+        left = 7
+        right = 9
     else:
-        left = 9*direction
-        right = 7*direction
+        left = -9
+        right = -7
 
     captureLeft = shift(bb & notAfile, left) & oppPieces
     captureRight = shift(bb & notHfile, right) & oppPieces
@@ -230,16 +236,16 @@ def pawnMoves(square: int, ownPieces: int, allPieces: int, oppPieces: int, direc
 
     return single | double | captureLeft | captureRight | epLeft | epRight
 
-def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, direction: int, enPassantSq: int) -> list[Move]:
+def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, colour: str, enPassantSq: int) -> list[Move]:
     moves = []
-    if direction == 1:
-        backRank = rank1
-    else: 
+    if colour == "white":
         backRank = rank8
+    else: 
+        backRank = rank1
 
     while pawnsBB:
         fromSq = lsb(pawnsBB)
-        attacks = pawnMoves(fromSq, ownPieces, allPieces, oppPieces, direction, enPassantSq)
+        attacks = pawnMoves(fromSq, ownPieces, allPieces, oppPieces, colour, enPassantSq)
     
         while attacks:
             toSq = lsb(attacks)
@@ -256,19 +262,19 @@ def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, d
     
     return moves
 
-def pawnAttacks(square: int, direction: int, enPassantSq: int) -> int:
+def pawnAttacks(square: int, colour: str, enPassantSq: int) -> int:
     bb = 1 << square
 
     def shift(bb, n):
         return bb << n if n > 0 else bb >> -n
     
     # Flipped left and right for black
-    if direction == 1:
-        left = 7*direction
-        right = 9*direction
+    if colour == "white":
+        left = 7
+        right = 9
     else:
-        left = 9*direction
-        right = 7*direction
+        left = -9
+        right = -7
     
     captureLeft = shift(bb & notAfile, left) 
     captureRight = shift(bb & notHfile, right)
