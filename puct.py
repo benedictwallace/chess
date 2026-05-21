@@ -4,7 +4,7 @@ import numpy as np
 
 from encoding import encode
 from move_encoding import encodeMove, NUM_ACTIONS
-
+from moves import Move
 
 def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
     """
@@ -75,8 +75,11 @@ def puctScore(child, parent, c=1.5):
     return q + u
 
 
-
-def searchPUCT(rootEnv, net, iterations=400, c=1.5):
+def searchPUCT(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
+               noise_frac=0.25) -> tuple[Node, dict[Move, int]]:
+    """
+    
+    """
     root = Node()
     root.moverSign = 0
 
@@ -114,12 +117,33 @@ def searchPUCT(rootEnv, net, iterations=400, c=1.5):
                 node.children.append(child)
             node.expanded = True
 
+            if add_noise and node is root:
+                _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
+
         # 3. BACKPROP
         for n in path:
             n.visits += 1
             n.value += leaf_value_white_pov * n.moverSign
 
-    if not root.children:
-        return None
-    best = max(root.children, key=lambda ch: ch.visits)
-    return best.move
+    visit_counts = {ch.move: ch.visits for ch in root.children}
+    return root, visit_counts
+
+def select_move(visit_counts, temp=1.0):
+    """
+    choose move from root visit counts.
+    Args:
+        visit_counts: dict[Move, int]
+    """
+    moves = list(visit_counts.keys())
+    counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
+
+    if temp <= 1e-6 or counts.sum() == 0:
+        return moves[int(counts.argmax())]
+    
+    logits = counts ** (1.0 / temp)
+    probs = logits / logits.sum()
+    rng = np.random.default_rng()
+    return moves[rng.choice(len(moves), p=probs)]
+
+
+
