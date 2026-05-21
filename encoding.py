@@ -2,8 +2,8 @@ import numpy as np
 
 
 # Plane Layout:
-#   0-5  : current player pieces (pawn, knight, bishop, rook, queen, king)
-#   6-11 : oppenents pieces (pawn, knight, bishop, rook, queen, king)
+#   0-5  : current player pieces (pawn, bishop, knight, rook, queen, king)
+#   6-11 : oppenents pieces (pawn, bishop, knight, rook, queen, king)
 #   12   : side to move (all 1s for white, 0s for black)
 #   13-16: castling rights (own kingside, own queenside, opponents kingside, opponents queenside)
 #   17   : en passant target sq
