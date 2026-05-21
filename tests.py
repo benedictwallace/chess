@@ -152,8 +152,58 @@ def testBoard():
     print(perft(b, "white", 3))
     print(perft(b, "white", 4))
 
+def testOneMoveMate():
+    print("\n--- One-move-mate test (back-rank) ---")
+    from board import Board
+    from gameEnv import Chess
+    from moves import Move
 
+    b = Board()
+    for k in b.bb:
+        b.bb[k] = 0
+
+    # White: rook a1 (sq 0), king h1 (sq 7)
+    b.bb[("white", "rook")] = 1 << 0
+    b.bb[("white", "king")] = 1 << 7
+    # Black: king h8 (sq 63), pawns f7/g7/h7 (sq 53/54/55)
+    b.bb[("black", "king")] = 1 << 63
+    b.bb[("black", "pawn")] = (1 << 53) | (1 << 54) | (1 << 55)
+
+    # no castling rights in this position
+    b.whiteKCastle = b.whiteQCastle = False
+    b.blackKCastle = b.blackQCastle = False
+    b.sideToMove = "white"
+    b.updatePieces()
+
+    env = Chess()
+    env.board = b
+
+    # The mating move: rook a1 -> a8 (sq 0 -> sq 56)
+    mate = Move(fromSq=0, toSq=56)
+
+    # sanity: confirm it really is mate before testing the search
+    legal = env.legalMoves()
+    assert any(m.fromSq == 0 and m.toSq == 56 for m in legal), \
+        "Ra8 should be legal"
+
+    trial = env.clone()
+    trial.step(mate)
+    assert trial.isTerminal(), "after Ra8 the position should be terminal"
+    assert trial.board.checkMate("black"), "after Ra8 black should be mated"
+    print("Position verified: Ra8 is checkmate.")
+
+    net = ChessNet()
+    net.eval()
+
+    chosen = search(env, net, iterations=200)
+    print("Search chose:", chosen)
+    if chosen.fromSq == 0 and chosen.toSq == 56:
+        print("PASS search found the mate.")
+    else:
+        print("FAIL search missed the mate.")
 
 if __name__=="__main__":
 
-    testBoard()
+    testOneMoveMate()
+
+

@@ -68,11 +68,13 @@ def search(rootEnv, net, iterations=400, c=1.5):
         env = rootEnv.clone()
         path = [node]
 
+
         # 1. SELECTION: descend via PUCT until an unexpanded or terminal node
-        while node.expanded and not node.terminal:
+        while node.expanded and not node.terminal and node.children:
             node = max(node.children, key=lambda ch: puctScore(ch, node, c))
             env.step(node.move)
             path.append(node)
+
 
         # 2. EXPANSION + EVALUATION
         if node.terminal:
@@ -87,7 +89,11 @@ def search(rootEnv, net, iterations=400, c=1.5):
             for m, p in priors.items():
                 child = Node(parent=node, move=m, prior=p)
                 child.moverSign = 1 if mover == "white" else -1
-                child.terminal = False  # determined lazily when first selected
+                # check child terminality
+                childEnv = env.clone()
+                childEnv.step(m)
+                child.terminal = childEnv.isTerminal()
+
                 node.children.append(child)
             node.expanded = True
 
