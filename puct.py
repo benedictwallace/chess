@@ -1,7 +1,24 @@
 import math
 import torch
+import numpy as np
+
 from encoding import encode
 from move_encoding import encodeMove, NUM_ACTIONS
+
+
+def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
+    """
+    Mix Dirichlet noise into priors
+        p' = (1 - frac) * p + frac * noise
+    applied after root expanded.
+    """
+    if not root.children:
+        return
+    rng = np.random.default_rng()
+    noise = rng.dirichlet([alpha] * len(root.children))
+    for child, n in zip(root.children, noise):
+        child.prior = (1 - frac) * child.prior + frac*n
+
 
 
 def evaluate(net, env):
@@ -59,7 +76,7 @@ def puctScore(child, parent, c=1.5):
 
 
 
-def search(rootEnv, net, iterations=400, c=1.5):
+def searchPUCT(rootEnv, net, iterations=400, c=1.5):
     root = Node()
     root.moverSign = 0
 
