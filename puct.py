@@ -75,7 +75,7 @@ def puctScore(child, parent, c=1.5):
     return q + u
 
 
-def searchPUCT(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
+def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
                noise_frac=0.25) -> tuple[Node, dict[Move, int]]:
     """
     
