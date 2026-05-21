@@ -156,6 +156,40 @@ class Board:
         self.enPassantSq = -1
         self.sideToMove = "white"
 
+    def stateKey(self) -> tuple:
+        return (
+            self.bb[("white", "pawn")],
+            self.bb[("white", "knight")],
+            self.bb[("white", "bishop")],
+            self.bb[("white", "rook")],
+            self.bb[("white", "queen")],
+            self.bb[("white", "king")],
+            self.bb[("black", "pawn")],
+            self.bb[("black", "knight")],
+            self.bb[("black", "bishop")],
+            self.bb[("black", "rook")],
+            self.bb[("black", "queen")],
+            self.bb[("black", "king")],
+            self.sideToMove,
+            self.whiteKCastle, self.whiteQCastle,
+            self.blackKCastle, self.blackQCastle,
+            self.enPassantSq,
+        )
+
+    def clone(self):
+        new = Board.__new__(Board) # skip __init__
+        new.bb = dict(self.bb)            
+        new.whiteKCastle = self.whiteKCastle
+        new.whiteQCastle = self.whiteQCastle
+        new.blackKCastle = self.blackKCastle
+        new.blackQCastle = self.blackQCastle
+        new.whitePieces = self.whitePieces
+        new.blackPieces = self.blackPieces
+        new.allPieces = self.allPieces
+        new.enPassantSq = self.enPassantSq
+        new.sideToMove = self.sideToMove
+        return new
+
     def getWhitePieces(self) -> int:
         result = 0
         for (colour, _), bb in self.bb.items():
@@ -284,7 +318,7 @@ class Board:
         pseudo = self.getMoves(colour)
         legal = []
         for move in pseudo:
-            trial = copy.deepcopy(self)
+            trial = self.clone()
             trial.makeMove(move)
             if not trial.inCheck(colour):
                 legal.append(move)
@@ -389,7 +423,7 @@ def perft(board, colour, depth):
         return 1
     total = 0
     for move in board.legalMoves(colour):
-        trial = copy.deepcopy(board)
+        trial = board.clone()
         trial.makeMove(move)
         next_colour = "black" if colour == "white" else "white"
         total += perft(trial, next_colour, depth - 1)
@@ -404,3 +438,5 @@ if __name__ == "__main__":
     print(perft(b, "white", 2))
     print(perft(b, "white", 3))
     print(perft(b, "white", 4))
+
+    #print(Board().stateKey() == Board().stateKey())

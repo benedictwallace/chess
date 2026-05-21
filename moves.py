@@ -3,7 +3,7 @@ from typing import Optional
 
 from bitboard import lsb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
 
-@dataclass
+@dataclass(frozen=True)
 class Move:
     fromSq: int
     toSq: int
