@@ -155,6 +155,7 @@ class Board:
         self.allPieces = self.blackPieces | self.whitePieces
         self.enPassantSq = -1
         self.sideToMove = "white"
+        self.history = []   # undo stack for make/unmake
 
     def stateKey(self) -> tuple:
         return (
@@ -188,6 +189,7 @@ class Board:
         new.allPieces = self.allPieces
         new.enPassantSq = self.enPassantSq
         new.sideToMove = self.sideToMove
+        new.history = []   # fresh undo stack; clones don't share history
         return new
 
     def getWhitePieces(self) -> int:
@@ -304,24 +306,48 @@ class Board:
 
         return moves
 
+    def squareAttackedBy(self, square: int, byColour: str) -> bool:
+        """
+        True if `square` is attacked by any `byColour` piece.
+        Casts each piece's pattern OUT from `square` and intersects with the
+        relevant enemy bitboard, so it stops at the first hit instead of
+        building the whole attack set.
+        """
+        occ = self.allPieces
+
+        # a byColour pawn attacks `square` from where an opposite-colour pawn
+        # placed on `square` would attack -> reuse the pawn-attack pattern
+        defColour = "black" if byColour == "white" else "white"
+        if pawnAttacks(square, defColour, -1) & self.bb[byColour, "pawn"]:
+            return True
+        if knightMoves(square) & self.bb[byColour, "knight"]:
+            return True
+        if kingMoves(square, 0, 0) & self.bb[byColour, "king"]:
+            return True
+        if bishopMoves(square, 0, occ) & (self.bb[byColour, "bishop"] | self.bb[byColour, "queen"]):
+            return True
+        if rookMoves(square, 0, occ) & (self.bb[byColour, "rook"] | self.bb[byColour, "queen"]):
+            return True
+        return False
+
     def inCheck(self, colour: str) -> bool:
-        if colour == "white":
-            return bool(self.bb["white", "king"] & self.getAttackedSq("black"))
-        else:
-            return bool(self.bb["black", "king"] & self.getAttackedSq("white"))
-        
+        oppColour = "black" if colour == "white" else "white"
+        kingSq = lsb(self.bb[colour, "king"])
+        return self.squareAttackedBy(kingSq, oppColour)
+
     def legalMoves(self, colour: str) -> list[Move]:
         """
         Return moves that don't leave our own king in check.
 
         """
-        pseudo = self.getMoves(colour)
+        oppColour = "black" if colour == "white" else "white"
         legal = []
-        for move in pseudo:
-            trial = self.clone()
-            trial.makeMove(move)
-            if not trial.inCheck(colour):
+        for move in self.getMoves(colour):
+            self.makeMove(move)
+            kingSq = lsb(self.bb[colour, "king"])
+            if not self.squareAttackedBy(kingSq, oppColour):
                 legal.append(move)
+            self.unmakeMove(move)
         return legal
 
     def pieceAt(self, square: Move) -> tuple[str]:
@@ -346,6 +372,13 @@ class Board:
         
         # find if move takes
         taken = self.pieceAt(move.toSq)
+
+        # save everything unmake can't recompute, BEFORE we mutate anything
+        self.history.append((
+            mover, taken, self.enPassantSq,
+            self.whiteKCastle, self.whiteQCastle,
+            self.blackKCastle, self.blackQCastle,
+        ))
 
         # move mover
         self.bb[mover] &= ~fromBB
@@ -401,10 +434,108 @@ class Board:
         if move.fromSq == 63 or move.toSq == 63:
             self.blackKCastle = False
 
-        # update pieces
-        self.updatePieces()
         
+        ownClear = fromBB
+        ownSet = toBB
+        if move.castle:
+            if move.toSq == 6:    ownClear |= (1 << 7);  ownSet |= (1 << 5)
+            elif move.toSq == 2:  ownClear |= (1 << 0);  ownSet |= (1 << 3)
+            elif move.toSq == 62: ownClear |= (1 << 63); ownSet |= (1 << 61)
+            elif move.toSq == 58: ownClear |= (1 << 56); ownSet |= (1 << 59)
+        oppClear = 0
+        if taken is not None:
+            oppClear |= toBB
+        if move.enPassant:
+            capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
+            oppClear |= (1 << capturedSq)
+        if colour == "white":
+            self.whitePieces = (self.whitePieces & ~ownClear) | ownSet
+            self.blackPieces &= ~oppClear
+        else:
+            self.blackPieces = (self.blackPieces & ~ownClear) | ownSet
+            self.whitePieces &= ~oppClear
+        self.allPieces = self.whitePieces | self.blackPieces
+
         self.sideToMove = "black" if self.sideToMove == "white" else "white"
+
+    def unmakeMove(self, move):
+        """
+        Reverse the most recent makeMove. `move` must be the same Move that was
+        last applied; the rest of the lost state is popped from self.history.
+        """
+        fromBB = 1 << move.fromSq
+        toBB = 1 << move.toSq
+
+        (mover, taken, prevEP,
+         wK, wQ, bK, bQ) = self.history.pop()
+
+        colour, piece = mover
+        oppColour = "black" if colour == "white" else "white"
+
+        # undo promotion: drop the promoted piece, restore the pawn to fromSq
+        if move.promotion is not None:
+            promoMap = {"Q": "queen", "R": "rook", "B": "bishop", "N": "knight"}
+            promoted = promoMap[move.promotion]
+            self.bb[colour, promoted] &= ~toBB
+            self.bb[colour, "pawn"] &= ~toBB     # ensure nothing left on toSq
+            self.bb[colour, "pawn"] |= fromBB
+        else:
+            # move the piece back from toSq to fromSq
+            self.bb[mover] &= ~toBB
+            self.bb[mover] |= fromBB
+
+        # undo the castling rook hop
+        if move.castle:
+            if move.toSq == 6:        # white kingside: rook 7->5, put it back
+                self.bb[colour, "rook"] &= ~(1 << 5)
+                self.bb[colour, "rook"] |= (1 << 7)
+            elif move.toSq == 2:      # white queenside: rook 0->3
+                self.bb[colour, "rook"] &= ~(1 << 3)
+                self.bb[colour, "rook"] |= (1 << 0)
+            elif move.toSq == 62:     # black kingside: rook 63->61
+                self.bb[colour, "rook"] &= ~(1 << 61)
+                self.bb[colour, "rook"] |= (1 << 63)
+            elif move.toSq == 58:     # black queenside: rook 56->59
+                self.bb[colour, "rook"] &= ~(1 << 59)
+                self.bb[colour, "rook"] |= (1 << 56)
+
+        # restore a normally-captured piece on toSq
+        if taken is not None:
+            self.bb[taken] |= toBB
+
+        # restore an en-passant-captured pawn (it never sat on toSq)
+        if move.enPassant:
+            capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
+            self.bb[oppColour, "pawn"] |= (1 << capturedSq)
+
+        # restore scalar state and side to move
+        self.enPassantSq = prevEP
+        self.whiteKCastle, self.whiteQCastle = wK, wQ
+        self.blackKCastle, self.blackQCastle = bK, bQ
+
+        # incremental occupancy update (replaces updatePieces)
+        ownClear = toBB
+        ownSet = fromBB
+        if move.castle:
+            if move.toSq == 6:    ownClear |= (1 << 5);  ownSet |= (1 << 7)
+            elif move.toSq == 2:  ownClear |= (1 << 3);  ownSet |= (1 << 0)
+            elif move.toSq == 62: ownClear |= (1 << 61); ownSet |= (1 << 63)
+            elif move.toSq == 58: ownClear |= (1 << 59); ownSet |= (1 << 56)
+        oppSet = 0
+        if taken is not None:
+            oppSet |= toBB
+        if move.enPassant:
+            capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
+            oppSet |= (1 << capturedSq)
+        if colour == "white":
+            self.whitePieces = (self.whitePieces & ~ownClear) | ownSet
+            self.blackPieces |= oppSet
+        else:
+            self.blackPieces = (self.blackPieces & ~ownClear) | ownSet
+            self.whitePieces |= oppSet
+        self.allPieces = self.whitePieces | self.blackPieces
+
+        self.sideToMove = colour
 
     def checkMate(self, colour: str) -> bool:
         """
@@ -422,11 +553,11 @@ def perft(board, colour, depth):
     if depth == 0:
         return 1
     total = 0
+    next_colour = "black" if colour == "white" else "white"
     for move in board.legalMoves(colour):
-        trial = board.clone()
-        trial.makeMove(move)
-        next_colour = "black" if colour == "white" else "white"
-        total += perft(trial, next_colour, depth - 1)
+        board.makeMove(move)
+        total += perft(board, next_colour, depth - 1)
+        board.unmakeMove(move)
     return total
 
 

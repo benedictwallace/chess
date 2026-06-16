@@ -7,8 +7,15 @@ from network import ChessNet
 import torch
 from move_encoding import encodeMove, decodeMove, NUM_ACTIONS
 from puct import search
+import os
+from self_play import generate_games
+from train import ReplayBuffer, train_epoch
 
-
+def testGPU():
+    import torch
+    print(torch.__version__)
+    print(torch.version.cuda)
+    print(torch.cuda.is_available())
 
 def testEnv():
     env = Chess()
@@ -108,7 +115,7 @@ def testNetwork():
     x = torch.from_numpy(planes).unsqueeze(0)      # (1, 18, 8, 8) add batch dim
 
     with torch.no_grad():
-        policy_logits, value = net(x)
+        policy_logits, value, ease = net(x)
 
     print("Policy logits shape:", policy_logits.shape)   # (1, 4672)
     print("Value shape:", value.shape)                   # (1, 1)
@@ -117,7 +124,7 @@ def testNetwork():
     # also test a batch
     batch = torch.from_numpy(np.stack([planes, planes, planes]))  # (3, 18, 8, 8)
     with torch.no_grad():
-        pl, v = net(batch)
+        pl, v, e = net(batch)
     print("Batch policy:", pl.shape, "Batch value:", v.shape)     # (3,4672) (3,1)
 
 def testEncodingMove():
@@ -202,8 +209,51 @@ def testOneMoveMate():
     else:
         print("FAIL search missed the mate.")
 
+
+def testTrainingLoop():
+    """
+    Scaled-down self-play -> train -> checkpoint loop. Verifies the
+    pipeline runs end to end and the loss is a finite number.
+    """
+
+    print("\n--- Training loop smoke test ---")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+
+    rng = np.random.default_rng(0)
+    torch.manual_seed(0)
+
+    # small net + tiny config so this finishes in well under a minute
+    net = ChessNet(channels=16, num_blocks=2).to(device)
+    optimiser = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    buffer = ReplayBuffer(capacity=10_000)
+
+    for it in range(1, 3):  # 2 loop iterations
+        print(f"loop iteration {it}/2")
+
+        examples = generate_games(
+            net, num_games=3,
+            iterations=15,
+            max_plies=16,
+            temp_moves=4,
+        )
+        buffer.add_examples(examples)
+        print(f"  buffer size: {len(buffer)}")
+
+        tot, pol, val, ez = train_epoch(
+            net, buffer, optimiser, device,
+            batches=4, batch_size=32,
+        )
+        print(f"  loss total={tot:.4f}  policy={pol:.4f}  value={val:.4f}")
+
+        # sanity checks -- catch the failure modes a long run would waste time on
+        assert len(buffer) > 0, "buffer is empty -- self-play produced nothing"
+        assert np.isfinite(tot), f"loss is not finite: {tot}"
+        assert pol >= 0, f"policy loss should be non-negative, got {pol}"
+
+    print("PASS training loop runs end to end.")
+
 if __name__=="__main__":
 
-    testOneMoveMate()
-
-
+    testTrainingLoop()

@@ -1,12 +1,12 @@
-
 import os
+import csv
+import time
 import numpy as np
 import torch
 
 from network import ChessNet
-from self_play import generate_games
+from self_play_parallel import generate_games_parallel
 from train import ReplayBuffer, train_epoch
-
 
 
 CONFIG = dict(
@@ -29,21 +29,22 @@ CONFIG = dict(
     batch_size=128,
     lr=1e-3,
     weight_decay=1e-4,
+    ease_weight=1.0,           # weight on the forgiveness (ease) loss
 
     # io
+    workers=None,              # self-play processes; None = all cores
     checkpoint_dir="checkpoints",
     checkpoint_every=5,
+    metrics_file="metrics.csv",
 )
-
 
 
 def main(cfg=CONFIG):
     """
-    Main function to run all training.
+    Run the full self-play -> train -> checkpoint loop, logging all losses.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
-
 
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"])
     net.to(device)
@@ -55,40 +56,65 @@ def main(cfg=CONFIG):
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
-    for it in range(1, cfg["loop_iterations"]+1):
-        print(f"\n ===== Loop iteration {it}/{cfg["loop_iterations"]} =====")
+    # ---- metrics log: write a header once, then append a row per iteration ----
+    metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
+    new_log = not os.path.exists(metrics_path)
+    metrics_f = open(metrics_path, "a", newline="")
+    writer = csv.writer(metrics_f)
+    if new_log:
+        writer.writerow([
+            "iteration", "buffer_size",
+            "loss_total", "loss_policy", "loss_value", "loss_ease",
+            "selfplay_sec", "train_sec",
+        ])
+        metrics_f.flush()
 
+    for it in range(1, cfg["loop_iterations"] + 1):
+        n_iters = cfg["loop_iterations"]
+        print(f"\n ===== Loop iteration {it}/{n_iters} =====")
 
         print("self play")
-        examples = generate_games(
+        t0 = time.time()
+        examples = generate_games_parallel(
             net, cfg["games_per_iter"],
             iterations=cfg["search_iterations"],
             max_plies=cfg["max_plies"],
             temp_moves=cfg["temp_moves"],
+            workers=cfg["workers"],
         )
+        selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
-        print(f"  buffer size: {len(buffer)}")
+        print(f"  buffer size: {len(buffer)}  (self-play {selfplay_sec:.1f}s)")
 
         print("training")
-        total, policy_l, value_l = train_epoch(
+        t0 = time.time()
+        total, policy_l, value_l, ease_l = train_epoch(
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
+            ease_weight=cfg["ease_weight"],
         )
+        train_sec = time.time() - t0
 
-        print(f"  loss total={total:.4f}  policy={policy_l:.4f}  value={value_l:.4f}")
+        print(f"  loss total={total:.4f}  policy={policy_l:.4f}  "
+              f"value={value_l:.4f}  ease={ease_l:.4f}  (train {train_sec:.1f}s)")
 
+        # ---- log this iteration's metrics ----
+        writer.writerow([
+            it, len(buffer),
+            f"{total:.6f}", f"{policy_l:.6f}", f"{value_l:.6f}", f"{ease_l:.6f}",
+            f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
+        ])
+        metrics_f.flush()
 
-
-        # checkpoint saving
-
+        # ---- checkpoint saving ----
         ckpt = {"iteration": it, "model_state": net.state_dict(),
                 "optim_state": optimiser.state_dict(), "config": cfg}
 
         # always overwrite "latest" so resuming is trivial
         torch.save(ckpt, os.path.join(cfg["checkpoint_dir"], "latest.pt"))
 
-        # keep a milestone only every N iterations (and always the final one)
+        # keep a milestone every N iterations (and always the final one)
         if it % cfg["checkpoint_every"] == 0 or it == cfg["loop_iterations"]:
             path = os.path.join(cfg["checkpoint_dir"], f"net_iter{it}.pt")
             torch.save(ckpt, path)
@@ -96,10 +122,9 @@ def main(cfg=CONFIG):
         else:
             print("  saved latest.pt")
 
-    print("\ndone.")
-
+    metrics_f.close()
+    print(f"\ndone. metrics -> {metrics_path}")
 
 
 if __name__ == "__main__":
     main()
-

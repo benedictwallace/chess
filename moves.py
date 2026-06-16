@@ -11,11 +11,8 @@ class Move:
     castle: bool = False
     enPassant: bool = False
 
-def knightMoves(square: int) -> int:
-    # Square index number not bb
-    # Grid numbers 0 to 63
+def _knight_attacks(square: int) -> int:
     bb = 1 << square
-
     moves = (
         ((bb & notAfile & notBfile) << 6) |
         ((bb & notHfile & notGfile) << 10) |
@@ -26,8 +23,13 @@ def knightMoves(square: int) -> int:
         ((bb & notHfile) >> 15) |
         ((bb & notAfile) >> 17)
     )
-
     return moves & BOARD
+
+# precompute once at import: square -> attack bitboard
+KNIGHT_ATTACKS = [_knight_attacks(sq) for sq in range(64)]
+
+def knightMoves(square: int) -> int:
+    return KNIGHT_ATTACKS[square]
 
 def getKnightMoves(knightsBB: int, ownPieces: int) -> list[Move]:
     moves = []
@@ -157,21 +159,25 @@ def getQueenMoves(queensBB: int, ownPieces: int, allPieces: int) -> list[Move]:
     
     return moves
 
-def kingMoves(square: int, ownPieces: int, attacksBB: int) -> int:
+def _king_attacks(square: int) -> int:
     bb = 1 << square
-
     moves = (
         ((bb << 8)) |
         ((bb >> 8)) |
-        ((bb << 1) & notHfile) |
-        ((bb >> 1) & notAfile) |
+        ((bb << 1) & notAfile) |
+        ((bb >> 1) & notHfile) |
         ((bb << 7) & notHfile) |
         ((bb >> 7) & notAfile) |
         ((bb << 9) & notAfile) |
         ((bb >> 9) & notHfile)
     )
+    return moves & BOARD
 
-    return moves & ~ownPieces & ~attacksBB & BOARD
+# precompute once at import: square -> raw king attack bitboard
+KING_ATTACKS = [_king_attacks(sq) for sq in range(64)]
+
+def kingMoves(square: int, ownPieces: int, attacksBB: int) -> int:
+    return KING_ATTACKS[square] & ~ownPieces & ~attacksBB
 
 def getKingMoves(kingsBB: int, ownPieces: int, attackBB: int) -> list[Move]:
     """
@@ -262,30 +268,25 @@ def getPawnMoves(pawnsBB: int, ownPieces: int, allPieces: int, oppPieces: int, c
     
     return moves
 
-def pawnAttacks(square: int, colour: str, enPassantSq: int) -> int:
+def _pawn_attacks(square: int, colour: str) -> int:
     bb = 1 << square
-
     def shift(bb, n):
         return bb << n if n > 0 else bb >> -n
-    
-    # Flipped left and right for black
     if colour == "white":
-        left = 7
-        right = 9
+        left, right = 7, 9
     else:
-        left = -9
-        right = -7
-    
-    captureLeft = shift(bb & notAfile, left) 
+        left, right = -9, -7
+    captureLeft = shift(bb & notAfile, left)
     captureRight = shift(bb & notHfile, right)
+    # the old en-passant terms were subsets of these and added nothing
+    return (captureLeft | captureRight) & BOARD
 
-    if enPassantSq >= 0:
-        epBB        = 1 << enPassantSq
-        epLeft      = shift(bb & notAfile, left) & epBB
-        epRight     = shift(bb & notHfile, right) & epBB
-    else:
-        epLeft = epRight = 0
+# precompute once at import: colour -> square -> attack bitboard
+PAWN_ATTACKS = {
+    "white": [_pawn_attacks(sq, "white") for sq in range(64)],
+    "black": [_pawn_attacks(sq, "black") for sq in range(64)],
+}
 
-    return (captureLeft | captureRight | epLeft | epRight) & BOARD
-
-
+def pawnAttacks(square: int, colour: str, enPassantSq: int) -> int:
+    # enPassantSq kept for signature compatibility; it never affected the result
+    return PAWN_ATTACKS[colour][square]

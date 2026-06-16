@@ -38,14 +38,23 @@ class ChessNet(nn.Module):
             [ResidualBlock(channels) for _ in range(num_blocks)]
         )
 
+        # policy head
         self.policy_conv = nn.Conv2d(channels, 2, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * 8 * 8, NUM_ACTIONS)
 
+        # value head -> game outcome in [-1, 1], mover's POV
         self.value_conv = nn.Conv2d(channels, 1, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
         self.value_fc1 = nn.Linear(1 * 8 * 8, 64)
         self.value_fc2 = nn.Linear(64, 1)
+
+        # ease head -> forgiveness of the position in [0, 1]
+        # absolute (not side-to-move-signed): a property of the position itself.
+        self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
+        self.ease_bn = nn.BatchNorm2d(1)
+        self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
+        self.ease_fc2 = nn.Linear(64, 1)
 
     def forward(self, x):
         # x shape: (batch, 18, 8, 8)
@@ -65,4 +74,11 @@ class ChessNet(nn.Module):
         # tanh to match reward, -1 loss 0 draw, 1 win
         value = torch.tanh(self.value_fc2(v))
 
-        return policy_logits, value
+        # ease head -> (batch, 1) in [0, 1]
+        e = F.relu(self.ease_bn(self.ease_conv(x)))
+        e = e.reshape(e.size(0), -1)
+        e = F.relu(self.ease_fc1(e))
+        # sigmoid to match the forgiveness target (a fraction in [0, 1])
+        ease = torch.sigmoid(self.ease_fc2(e))
+
+        return policy_logits, value, ease

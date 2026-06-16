@@ -21,24 +21,25 @@ def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
 
 
 
-def evaluate(net, env):
+def evaluate(net, env, legal=None):
     """Run the network on the current position.
     Returns (priors, value):
         priors: dict {Move: probability} over LEGAL moves only
         value:  float in [-1, 1], from the mover's perspective
     """
     board = env.board
-    legal = env.legalMoves()
-
+    if legal is None:
+        legal = env.legalMoves()
     if not legal:
-        return {}, 0.0 # terminal
+        return {}, 0.0
 
     planes = encode(board)
     x = torch.from_numpy(planes).unsqueeze(0) # (1, 18, 8, 8)
-
+    x = x.to(next(net.parameters()).device)
+    
     net.eval()
     with torch.no_grad():
-        policy_logits, value = net(x)
+        policy_logits, value, _ = net(x)
 
     logits = policy_logits[0] # (4672,)
 
@@ -102,23 +103,22 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
             r = env.result()
             leaf_value_white_pov = r if r is not None else 0.0
         else:
-            priors, value = evaluate(net, env)
-            leaf_value_white_pov = value if env.board.sideToMove == "white" else -value
-
-            mover = env.board.sideToMove
-            for m, p in priors.items():
-                child = Node(parent=node, move=m, prior=p)
-                child.moverSign = 1 if mover == "white" else -1
-                # check child terminality
-                childEnv = env.clone()
-                childEnv.step(m)
-                child.terminal = childEnv.isTerminal()
-
-                node.children.append(child)
-            node.expanded = True
-
-            if add_noise and node is root:
-                _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
+            legal = env.legalMoves()
+            if not legal:
+                node.terminal = True
+                r = env.result()
+                leaf_value_white_pov = r if r is not None else 0.0
+            else:
+                priors, value = evaluate(net, env, legal)
+                leaf_value_white_pov = value if env.board.sideToMove == "white" else -value
+                mover = env.board.sideToMove
+                for m, p in priors.items():
+                    child = Node(parent=node, move=m, prior=p)
+                    child.moverSign = 1 if mover == "white" else -1
+                    node.children.append(child)
+                node.expanded = True
+                if add_noise and node is root:
+                    _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
 
         # 3. BACKPROP
         for n in path:
@@ -144,6 +144,3 @@ def select_move(visit_counts, temp=1.0):
     probs = logits / logits.sum()
     rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
-
-
-
