@@ -6,13 +6,6 @@ import torch
 import torch.nn.functional as F
 
 class ReplayBuffer:
-    """
-    Buffer of examples, training happens on most recent game plus random selection of 
-    past states, makes gradient more smooth, instead of training on lots of similar data
-    one move apart.
-
-    """
-
     def __init__(self, capacity=50_000):
         self.buffer = deque(maxlen=capacity)
 
@@ -21,42 +14,49 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
-    
+
     def sample(self, batch_size):
         n = min(batch_size, len(self.buffer))
         return random.sample(self.buffer, n)
-    
+
 
 def _collate(batch, device):
     """
-    shape batches + tensorise for GPU.
-    Each example: (planes, policy_target, value_target, ease_target, ease_mask)
+    Each example:
+      (planes, policy, value, ease, ease_mask, cliff, cliff_mask, stab, stab_mask)
     """
-    planes = np.stack([b[0] for b in batch])              # (B, 18, 8, 8)
-    policy = np.stack([b[1] for b in batch])              # (B, NUM_ACTIONS)
-    value  = np.array([b[2] for b in batch], np.float32)  # (B,)
-    ease   = np.array([b[3] for b in batch], np.float32)  # (B,)
-    emask  = np.array([b[4] for b in batch], np.float32)  # (B,)
+    planes = np.stack([b[0] for b in batch])               # (B,18,8,8)
+    policy = np.stack([b[1] for b in batch])               # (B,NUM_ACTIONS)
+    value  = np.array([b[2] for b in batch], np.float32)   # (B,)
+    ease   = np.array([b[3] for b in batch], np.float32)
+    emask  = np.array([b[4] for b in batch], np.float32)
+    cliff  = np.array([b[5] for b in batch], np.float32)
+    cmask  = np.array([b[6] for b in batch], np.float32)
+    stab   = np.array([b[7] for b in batch], np.float32)
+    smask  = np.array([b[8] for b in batch], np.float32)
 
-    planes = torch.from_numpy(planes).to(device)
-    policy = torch.from_numpy(policy).to(device)
-    value  = torch.from_numpy(value).to(device).unsqueeze(1)   # (B, 1)
-    ease   = torch.from_numpy(ease).to(device).unsqueeze(1)    # (B, 1)
-    emask  = torch.from_numpy(emask).to(device).unsqueeze(1)   # (B, 1)
-    return planes, policy, value, ease, emask
+    t = lambda a: torch.from_numpy(a).to(device)
+    planes = t(planes)
+    policy = t(policy)
+    value  = t(value).unsqueeze(1)
+    ease   = t(ease).unsqueeze(1);  emask = t(emask).unsqueeze(1)
+    cliff  = t(cliff).unsqueeze(1);  cmask = t(cmask).unsqueeze(1)
+    stab   = t(stab).unsqueeze(1);  smask = t(smask).unsqueeze(1)
+    return planes, policy, value, ease, emask, cliff, cmask, stab, smask
+
+
+def _masked_mse(pred, target, mask):
+    return (mask * (pred - target) ** 2).sum() / mask.sum().clamp(min=1.0)
 
 
 def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
-                ease_weight=1.0):
+                ease_weight=1.0, cliff_weight=1.0, stab_weight=1.0):
     """
-    Run gradient steps, sampling from buffer.
-
-    Returns:
-        mean_total_loss, mean_policy_loss, mean_value_loss, mean_ease_loss
+    Run gradient steps. Returns a dict of mean losses:
+      {total, policy, value, ease, cliff, stab}
     """
-
     net.train()
-    total, policy_l, value_l, ease_l = 0.0, 0.0, 0.0, 0.0
+    acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0, cliff=0.0, stab=0.0)
     actual = 0
 
     for _ in range(batches):
@@ -64,35 +64,35 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             break
 
         batch = buffer.sample(batch_size)
-        planes, policy_target, value_target, ease_target, ease_mask = _collate(batch, device)
+        (planes, policy_t, value_t,
+         ease_t, emask, cliff_t, cmask, stab_t, smask) = _collate(batch, device)
 
-        policy_logits, value_pred, ease_pred = net(planes)
+        policy_logits, value_p, ease_p, cliff_p, stab_p = net(planes)
 
-        # cross entropy between target dist and predicted.
         log_probs = F.log_softmax(policy_logits, dim=1)
-        policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
+        policy_loss = -(policy_t * log_probs).sum(dim=1).mean()
+        value_loss = F.mse_loss(value_p, value_t)
+        ease_loss = _masked_mse(ease_p, ease_t, emask)
+        cliff_loss = _masked_mse(cliff_p, cliff_t, cmask)
+        stab_loss = _masked_mse(stab_p, stab_t, smask)
 
-        value_loss = F.mse_loss(value_pred, value_target)
-
-        # masked MSE: only positions with a defined forgiveness target contribute
-        ease_sq = (ease_pred - ease_target) ** 2
-        denom = ease_mask.sum().clamp(min=1.0)
-        ease_loss = (ease_mask * ease_sq).sum() / denom
-
-        loss = policy_loss + value_loss + ease_weight * ease_loss
+        loss = (policy_loss + value_loss
+                + ease_weight * ease_loss
+                + cliff_weight * cliff_loss
+                + stab_weight * stab_loss)
 
         optimiser.zero_grad()
         loss.backward()
         optimiser.step()
 
-        total += loss.item()
-        policy_l += policy_loss.item()
-        value_l += value_loss.item()
-        ease_l += ease_loss.item()
+        acc["total"] += loss.item()
+        acc["policy"] += policy_loss.item()
+        acc["value"] += value_loss.item()
+        acc["ease"] += ease_loss.item()
+        acc["cliff"] += cliff_loss.item()
+        acc["stab"] += stab_loss.item()
         actual += 1
 
     if actual == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    
-    # avg losses
-    return total / actual, policy_l / actual, value_l / actual, ease_l / actual
+        return {k: 0.0 for k in acc}
+    return {k: v / actual for k, v in acc.items()}

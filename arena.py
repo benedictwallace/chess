@@ -177,7 +177,7 @@ def load_net(path, device):
     cfg = ckpt.get("config", {})
     net = ChessNet(channels=cfg.get("channels", 64),
                    num_blocks=cfg.get("num_blocks", 5))
-    net.load_state_dict(ckpt["model_state"])
+    net.load_state_dict(ckpt["model_state"], strict=False)
     net.to(device).eval()
     return net
 

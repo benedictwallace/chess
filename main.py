@@ -11,30 +11,32 @@ from train import ReplayBuffer, train_epoch
 
 CONFIG = dict(
     # network
-    channels=64,
-    num_blocks=5,
+    channels=256,
+    num_blocks=10,
 
     # outer loop
-    loop_iterations=20,        # self-play/train cycles
+    loop_iterations=500,        # self-play/train cycles
 
     # self-play
-    games_per_iter=10,
-    search_iterations=100,     # PUCT iterations per move
+    games_per_iter=30,
+    search_iterations=400,     # PUCT iterations per move
     max_plies=200,
     temp_moves=30,
 
     # training
-    buffer_capacity=50_000,
+    buffer_capacity=200_000,
     train_batches=32,
-    batch_size=128,
+    batch_size=256,
     lr=1e-3,
     weight_decay=1e-4,
     ease_weight=1.0,           # weight on the forgiveness (ease) loss
+    cliff_weight=1.0,          # weight on the cliff-return loss
+    stab_weight=1.0,           # weight on the trajectory-stability loss
 
     # io
-    workers=None,              # self-play processes; None = all cores
+    workers=10,              # self-play processes; None = all cores
     checkpoint_dir="checkpoints",
-    checkpoint_every=5,
+    checkpoint_every=10,
     metrics_file="metrics.csv",
 )
 
@@ -64,7 +66,8 @@ def main(cfg=CONFIG):
     if new_log:
         writer.writerow([
             "iteration", "buffer_size",
-            "loss_total", "loss_policy", "loss_value", "loss_ease",
+            "loss_total", "loss_policy", "loss_value",
+            "loss_ease", "loss_cliff", "loss_stab",
             "selfplay_sec", "train_sec",
         ])
         metrics_f.flush()
@@ -88,21 +91,25 @@ def main(cfg=CONFIG):
 
         print("training")
         t0 = time.time()
-        total, policy_l, value_l, ease_l = train_epoch(
+        losses = train_epoch(
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
             ease_weight=cfg["ease_weight"],
+            cliff_weight=cfg["cliff_weight"],
+            stab_weight=cfg["stab_weight"],
         )
         train_sec = time.time() - t0
 
-        print(f"  loss total={total:.4f}  policy={policy_l:.4f}  "
-              f"value={value_l:.4f}  ease={ease_l:.4f}  (train {train_sec:.1f}s)")
+        print(f"  loss total={losses['total']:.4f}  policy={losses['policy']:.4f}  "
+              f"value={losses['value']:.4f}  ease={losses['ease']:.4f}  "
+              f"cliff={losses['cliff']:.4f}  stab={losses['stab']:.4f}  (train {train_sec:.1f}s)")
 
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
-            f"{total:.6f}", f"{policy_l:.6f}", f"{value_l:.6f}", f"{ease_l:.6f}",
+            f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
+            f"{losses['ease']:.6f}", f"{losses['cliff']:.6f}", f"{losses['stab']:.6f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
         ])
         metrics_f.flush()

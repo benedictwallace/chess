@@ -39,7 +39,7 @@ def evaluate(net, env, legal=None):
     
     net.eval()
     with torch.no_grad():
-        policy_logits, value, _ = net(x)
+        policy_logits, value, *_ = net(x)
 
     logits = policy_logits[0] # (4672,)
 

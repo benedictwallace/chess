@@ -1,12 +1,17 @@
 """
-Each example gives (planes, policy_target, value_target, ease_target, ease_mask)
+Each example: (planes, policy_target, value_target,
+               ease_target, ease_mask,
+               cliff_target, cliff_mask,
+               stab_target, stab_mask)
 
   value_target : game outcome from the mover's POV (signed by mover_sign)
-  ease_target  : forgiveness of the position in [0, 1] -- ABSOLUTE (a property of
-                 the position, NOT signed by mover_sign). It is the share of
-                 well-visited root moves whose Q is within `delta` of the best.
-  ease_mask    : 1.0 if ease_target is defined, 0.0 for forced/near-forced
-                 positions where forgiveness is meaningless (masked out of loss).
+  ease_target  : frac_safe forgiveness in [0,1]   -- ABSOLUTE (unsigned)
+  cliff_target : cliff-size discounted return in [0,1] -- ABSOLUTE (unsigned)
+  stab_target  : trajectory stability in [0,1]    -- ABSOLUTE (unsigned)
+  *_mask       : 1.0 if the target is defined, else 0.0 (masked out of loss)
+
+All three auxiliary signals are RECORD-ONLY: trained as heads, never used to
+steer search.
 """
 
 import numpy as np
@@ -18,37 +23,17 @@ from puct import search, select_move
 
 
 def _policy_target(visit_counts):
-    """
-    Map moves to logit encoding and normalise.
-
-    Returns:
-        target: encoded move mapping with visit counts.
-    """
     target = np.zeros(NUM_ACTIONS, dtype=np.float32)
     total = sum(visit_counts.values())
-
     if total == 0:
         return target
     for move, count in visit_counts.items():
-        target[encodeMove(move)] = count/total
+        target[encodeMove(move)] = count / total
     return target
 
 
 def _forgiveness(root, min_visits=5, delta=0.1):
-    """
-    Absolute forgiveness ('ease') of the root position, computed from the
-    finished search tree.
-
-    All root children were entered by the same player (the side to move at the
-    root), so their Q = value/visits are in one shared frame and directly
-    comparable -- no sign flip needed. We only trust children with enough
-    visits, since a thinly-visited child's Q is noise.
-
-    Returns:
-        frac_safe in [0, 1]: share of well-visited moves within `delta` of the
-        best move's Q (high -> flat/forgiving, low -> only-move position), or
-        None when fewer than two moves are well-visited (forgiveness undefined).
-    """
+    """frac_safe: share of well-visited root moves within `delta` of the best Q."""
     qs = [c.value / c.visits for c in root.children if c.visits >= min_visits]
     if len(qs) < 2:
         return None
@@ -56,23 +41,65 @@ def _forgiveness(root, min_visits=5, delta=0.1):
     return sum(q >= q_best - delta for q in qs) / len(qs)
 
 
+def _cliff_return(node, gamma, min_visits):
+    """
+    Recursive cliff-size discounted return over the finished search tree.
+    local cliff = (best_Q - second_best_Q)/2 in [0,1] (cost of erring here);
+    aggregated as an exponentially-weighted average over the visit-weighted
+    future:  ease(n) = (1-gamma)*local + gamma * E_children[ease(child)].
+    """
+    kids = [c for c in node.children if c.visits >= min_visits]
+    if len(kids) >= 2:
+        qs = sorted((c.value / c.visits for c in kids), reverse=True)
+        local = (qs[0] - qs[1]) / 2.0
+    else:
+        local = 0.0
+    if not kids:
+        return local
+    tot = sum(c.visits for c in kids)
+    cont = sum((c.visits / tot) * _cliff_return(c, gamma, min_visits) for c in kids)
+    return (1.0 - gamma) * local + gamma * cont
+
+
+def _cliff_target(root, gamma=0.9, min_visits=5):
+    """Root cliff-return, or None when forgiveness is undefined at the root."""
+    kids = [c for c in root.children if c.visits >= min_visits]
+    if len(kids) < 2:
+        return None
+    return _cliff_return(root, gamma, min_visits)
+
+
+def _position_value_white(root, mover_sign):
+    """Search-policy-weighted value (mover frame) converted to white's POV."""
+    tot = sum(c.visits for c in root.children if c.visits > 0)
+    if tot == 0:
+        return 0.0
+    v_mover = sum(c.value for c in root.children if c.visits > 0) / tot
+    return v_mover * mover_sign
+
+
+def _trajectory_stability(values, t, horizon, scale=2.0):
+    """
+    Stability of position t = how little the white-POV value swings over the
+    next `horizon` plies of the ACTUAL game:  1 - mean|delta v| / scale, in
+    [0,1]. None when fewer than two values are available (near game end).
+    """
+    window = values[t: t + horizon + 1]
+    if len(window) < 2:
+        return None
+    deltas = [abs(window[i + 1] - window[i]) for i in range(len(window) - 1)]
+    mac = sum(deltas) / len(deltas)            # mean abs consecutive change, [0,2]
+    return max(0.0, 1.0 - mac / scale)
+
+
 def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
-              ease_min_visits=5, ease_delta=0.1):
-    """
-    Play one self-game. Return training examples.
-
-    Args:
-        net: network.
-        temp_moves: number of opening plies (one side moves) played at temperature 1,
-                    after that temperature drops to 0.
-        max_plies: hard cap on moves, game considered draw if met.
-        ease_min_visits / ease_delta: forgiveness-target hyperparameters.
-    """
-
+              ease_min_visits=5, ease_delta=0.1,
+              cliff_gamma=0.9, stab_horizon=8):
+    """Play one self-game; return training examples (9-tuples)."""
     env = Chess()
     env.reset()
 
-    # list of (planes, policy_target, mover_sign, ease_target, ease_mask)
+    # history rows: (planes, policy, mover_sign, ease, ease_mask, cliff, cliff_mask, v_white)
     history = []
 
     ply = 0
@@ -84,21 +111,21 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
         planes = encode(env.board)
 
         root, visit_counts = search(env, net, iterations=iterations, c=c, add_noise=True)
-
-        # no legal moves, terminal
         if not visit_counts:
             break
 
         policy_target = _policy_target(visit_counts)
 
-        # ease target is a property of THIS position, known now (no game result needed)
         ez = _forgiveness(root, ease_min_visits, ease_delta)
-        if ez is None:
-            ease_target, ease_mask = 0.0, 0.0      # undefined -> masked out of loss
-        else:
-            ease_target, ease_mask = ez, 1.0
+        ease_target, ease_mask = (ez, 1.0) if ez is not None else (0.0, 0.0)
 
-        history.append((planes, policy_target, mover_sign, ease_target, ease_mask))
+        cl = _cliff_target(root, cliff_gamma, ease_min_visits)
+        cliff_target, cliff_mask = (cl, 1.0) if cl is not None else (0.0, 0.0)
+
+        v_white = _position_value_white(root, mover_sign)
+
+        history.append((planes, policy_target, mover_sign,
+                        ease_target, ease_mask, cliff_target, cliff_mask, v_white))
 
         temperature = 1.0 if ply < temp_moves else 0.0
         move = select_move(visit_counts, temperature)
@@ -108,15 +135,23 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
     result = env.result()
     result_white_pov = result if result is not None else 0.0
 
+    values = [row[7] for row in history]        # white-POV value per ply
+
     examples = []
-    for planes, policy_target, mover_sign, ease_target, ease_mask in history:
-        value_target = result_white_pov * mover_sign            # mover's POV (signed)
+    for t, (planes, policy_target, mover_sign,
+            ease_target, ease_mask, cliff_target, cliff_mask, _v) in enumerate(history):
+        value_target = result_white_pov * mover_sign            # signed (mover POV)
+
+        st = _trajectory_stability(values, t, stab_horizon)
+        stab_target, stab_mask = (st, 1.0) if st is not None else (0.0, 0.0)
+
         examples.append((
             planes,
             policy_target,
             np.float32(value_target),
-            np.float32(ease_target),                            # absolute (unsigned)
-            np.float32(ease_mask),
+            np.float32(ease_target),  np.float32(ease_mask),
+            np.float32(cliff_target), np.float32(cliff_mask),
+            np.float32(stab_target),  np.float32(stab_mask),
         ))
 
     return examples
@@ -124,17 +159,10 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
 
 def generate_games(net, num_games, iterations=100, max_plies=200,
                    temp_moves=30, c=1.5, verbose=True):
-    """
-    Loops games, returns all examples.
-    """
-
-    rng = np.random.default_rng()
     all_examples = []
     for g in range(num_games):
         examples = play_game(net, iterations, max_plies, temp_moves, c)
         all_examples.extend(examples)
-
         if verbose:
             print(f"Game {g + 1}/{num_games}: {len(examples)} positions.")
-
     return all_examples

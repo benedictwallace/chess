@@ -115,7 +115,7 @@ def testNetwork():
     x = torch.from_numpy(planes).unsqueeze(0)      # (1, 18, 8, 8) add batch dim
 
     with torch.no_grad():
-        policy_logits, value, ease = net(x)
+        policy_logits, value, *_ = net(x)
 
     print("Policy logits shape:", policy_logits.shape)   # (1, 4672)
     print("Value shape:", value.shape)                   # (1, 1)
@@ -124,7 +124,7 @@ def testNetwork():
     # also test a batch
     batch = torch.from_numpy(np.stack([planes, planes, planes]))  # (3, 18, 8, 8)
     with torch.no_grad():
-        pl, v, e = net(batch)
+        pl, v, *_ = net(batch)
     print("Batch policy:", pl.shape, "Batch value:", v.shape)     # (3,4672) (3,1)
 
 def testEncodingMove():
@@ -241,16 +241,17 @@ def testTrainingLoop():
         buffer.add_examples(examples)
         print(f"  buffer size: {len(buffer)}")
 
-        tot, pol, val, ez = train_epoch(
+        losses = train_epoch(
             net, buffer, optimiser, device,
             batches=4, batch_size=32,
         )
-        print(f"  loss total={tot:.4f}  policy={pol:.4f}  value={val:.4f}")
+        tot = losses["total"]
+        print("  loss " + "  ".join(f"{k}={v:.4f}" for k, v in losses.items()))
 
         # sanity checks -- catch the failure modes a long run would waste time on
         assert len(buffer) > 0, "buffer is empty -- self-play produced nothing"
         assert np.isfinite(tot), f"loss is not finite: {tot}"
-        assert pol >= 0, f"policy loss should be non-negative, got {pol}"
+        assert losses["policy"] >= 0, "policy loss should be non-negative"
 
     print("PASS training loop runs end to end.")
 
