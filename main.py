@@ -8,18 +8,19 @@ from network import ChessNet
 from self_play_parallel import generate_games_parallel
 from train import ReplayBuffer, train_epoch
 
+torch.backends.cudnn.benchmark = True
 
 CONFIG = dict(
     # network
-    channels=256,
-    num_blocks=10,
+    channels=96,
+    num_blocks=8,
 
     # outer loop
-    loop_iterations=500,        # self-play/train cycles
+    loop_iterations=200,        # self-play/train cycles
 
     # self-play
-    games_per_iter=30,
-    search_iterations=400,     # PUCT iterations per move
+    games_per_iter=24,
+    search_iterations=300,     # PUCT iterations per move
     max_plies=200,
     temp_moves=30,
 
@@ -34,7 +35,7 @@ CONFIG = dict(
     stab_weight=1.0,           # weight on the trajectory-stability loss
 
     # io
-    workers=10,              # self-play processes; None = all cores
+    workers=18,              # self-play processes; None = all cores
     checkpoint_dir="checkpoints",
     checkpoint_every=10,
     metrics_file="metrics.csv",
@@ -50,6 +51,8 @@ def main(cfg=CONFIG):
 
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"])
     net.to(device)
+
+    net = torch.compile(net, mode="reduce-overhead")
 
     optimiser = torch.optim.Adam(
         net.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
@@ -67,7 +70,7 @@ def main(cfg=CONFIG):
         writer.writerow([
             "iteration", "buffer_size",
             "loss_total", "loss_policy", "loss_value",
-            "loss_ease", "loss_cliff", "loss_stab",
+            # "loss_ease", "loss_cliff", "loss_stab",
             "selfplay_sec", "train_sec",
         ])
         metrics_f.flush()
@@ -95,21 +98,22 @@ def main(cfg=CONFIG):
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
-            ease_weight=cfg["ease_weight"],
-            cliff_weight=cfg["cliff_weight"],
-            stab_weight=cfg["stab_weight"],
+            # ease_weight=cfg["ease_weight"],
+            # cliff_weight=cfg["cliff_weight"],
+            # stab_weight=cfg["stab_weight"],
         )
         train_sec = time.time() - t0
 
         print(f"  loss total={losses['total']:.4f}  policy={losses['policy']:.4f}  "
               f"value={losses['value']:.4f}  ease={losses['ease']:.4f}  "
-              f"cliff={losses['cliff']:.4f}  stab={losses['stab']:.4f}  (train {train_sec:.1f}s)")
+              #f"cliff={losses['cliff']:.4f}  stab={losses['stab']:.4f} " 
+              f"(train {train_sec:.1f}s)")
 
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
             f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
-            f"{losses['ease']:.6f}", f"{losses['cliff']:.6f}", f"{losses['stab']:.6f}",
+            #f"{losses['ease']:.6f}", f"{losses['cliff']:.6f}", f"{losses['stab']:.6f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
         ])
         metrics_f.flush()

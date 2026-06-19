@@ -39,6 +39,9 @@ def _init_worker(state_dict, channels, num_blocks):
     net = ChessNet(channels=channels, num_blocks=num_blocks)
     net.load_state_dict(state_dict)
     net.eval()
+    
+    # COMPILE HERE: Optimizes individual CPU inference paths for your workers
+    net = torch.compile(net)
     _WORKER_NET = net
 
 

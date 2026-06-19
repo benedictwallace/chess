@@ -116,16 +116,15 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
 
         policy_target = _policy_target(visit_counts)
 
-        ez = _forgiveness(root, ease_min_visits, ease_delta)
-        ease_target, ease_mask = (ez, 1.0) if ez is not None else (0.0, 0.0)
+        #ez = _forgiveness(root, ease_min_visits, ease_delta)
+        #ease_target, ease_mask = (ez, 1.0) if ez is not None else (0.0, 0.0)
 
-        cl = _cliff_target(root, cliff_gamma, ease_min_visits)
-        cliff_target, cliff_mask = (cl, 1.0) if cl is not None else (0.0, 0.0)
+        #cl = _cliff_target(root, cliff_gamma, ease_min_visits)
+        #cliff_target, cliff_mask = (cl, 1.0) if cl is not None else (0.0, 0.0)
 
         v_white = _position_value_white(root, mover_sign)
 
-        history.append((planes, policy_target, mover_sign,
-                        ease_target, ease_mask, cliff_target, cliff_mask, v_white))
+        history.append((planes, policy_target, mover_sign, v_white))
 
         temperature = 1.0 if ply < temp_moves else 0.0
         move = select_move(visit_counts, temperature)
@@ -141,20 +140,19 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
     values = [row[7] for row in history]        # white-POV value per ply
 
     examples = []
-    for t, (planes, policy_target, mover_sign,
-            ease_target, ease_mask, cliff_target, cliff_mask, _v) in enumerate(history):
+    for t, (planes, policy_target, mover_sign, _v) in enumerate(history):
         value_target = result_white_pov * mover_sign            # signed (mover POV)
 
-        st = _trajectory_stability(values, t, stab_horizon)
-        stab_target, stab_mask = (st, 1.0) if st is not None else (0.0, 0.0)
+        # st = _trajectory_stability(values, t, stab_horizon)
+        # stab_target, stab_mask = (st, 1.0) if st is not None else (0.0, 0.0)
 
         examples.append((
             planes,
             policy_target,
             np.float32(value_target),
-            np.float32(ease_target),  np.float32(ease_mask),
-            np.float32(cliff_target), np.float32(cliff_mask),
-            np.float32(stab_target),  np.float32(stab_mask),
+            # np.float32(ease_target),  np.float32(ease_mask),
+            # np.float32(cliff_target), np.float32(cliff_mask),
+            # np.float32(stab_target),  np.float32(stab_mask),
         ))
 
     return examples

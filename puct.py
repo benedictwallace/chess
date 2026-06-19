@@ -38,19 +38,21 @@ def evaluate(net, env, legal=None):
     x = x.to(next(net.parameters()).device)
     
     net.eval()
+
     with torch.no_grad():
-        policy_logits, value, *_ = net(x)
+        policy_logits, value_tensor = net(x)
+        
+    logits = policy_logits.squeeze(0)
+    value = float(value_tensor.item())
 
-    logits = policy_logits[0] # (4672,)
-
-    # Mask: keep only legal-move logits, softmax on them
     legal_indices = [encodeMove(m) for m in legal]
-    legal_logits = torch.tensor([logits[i] for i in legal_indices])
+    
+    # 2. FIX THE PYTHON LOOP: Use native vectorized advanced indexing
+    legal_logits = logits[legal_indices] 
     probs = torch.softmax(legal_logits, dim=0)
-
-    priors = {m: probs[k].item() for k, m in enumerate(legal)}
-
-    return priors, value.item()
+    
+    priors = {m: float(probs[i].item()) for i, m in enumerate(legal)}
+    return priors, value
 
 class Node:
     def __init__(self, parent=None, move=None, prior=0.0):

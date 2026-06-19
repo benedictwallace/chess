@@ -65,14 +65,14 @@ class ChessNet(nn.Module):
         self.value_fc2 = nn.Linear(64, 1)
 
         # ease head -> forgiveness (frac_safe) in [0, 1]  (unchanged keys)
-        self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
-        self.ease_bn = nn.BatchNorm2d(1)
-        self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
-        self.ease_fc2 = nn.Linear(64, 1)
+        # self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
+        # self.ease_bn = nn.BatchNorm2d(1)
+        # self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
+        # self.ease_fc2 = nn.Linear(64, 1)
 
-        # record-only heads, both in [0, 1]
-        self.cliff_head = ScalarHead(channels, torch.sigmoid)  # cliff-size discounted return
-        self.stab_head = ScalarHead(channels, torch.sigmoid)   # trajectory stability
+        # # record-only heads, both in [0, 1]
+        # self.cliff_head = ScalarHead(channels, torch.sigmoid)  # cliff-size discounted return
+        # self.stab_head = ScalarHead(channels, torch.sigmoid)   # trajectory stability
 
     def forward(self, x):
         x = self.stem(x)
@@ -88,12 +88,12 @@ class ChessNet(nn.Module):
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
 
-        e = F.relu(self.ease_bn(self.ease_conv(x)))
-        e = e.reshape(e.size(0), -1)
-        e = F.relu(self.ease_fc1(e))
-        ease = torch.sigmoid(self.ease_fc2(e))
+        # e = F.relu(self.ease_bn(self.ease_conv(x)))
+        # e = e.reshape(e.size(0), -1)
+        # e = F.relu(self.ease_fc1(e))
+        # ease = torch.sigmoid(self.ease_fc2(e))
 
-        cliff = self.cliff_head(x)
-        stab = self.stab_head(x)
+        # cliff = self.cliff_head(x)
+        # stab = self.stab_head(x)
 
-        return policy_logits, value, ease, cliff, stab
+        return policy_logits, value
