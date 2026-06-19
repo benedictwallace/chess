@@ -133,7 +133,10 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
         ply += 1
 
     result = env.result()
-    result_white_pov = result if result is not None else 0.0
+    if result is None:                 # hit the ply cap -> adjudicate by material
+        result_white_pov = env.adjudicate()
+    else:
+        result_white_pov = result
 
     values = [row[7] for row in history]        # white-POV value per ply
 

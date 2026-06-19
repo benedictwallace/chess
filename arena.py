@@ -104,7 +104,9 @@ def play_game(white_agent, black_agent, max_plies=200):
         ply += 1
 
     r = env.result()           # +1 white, -1 black, 0 draw, None if not terminal
-    if r is None or r == 0:
+    if r is None:              # ply cap reached -> adjudicate by material
+        r = env.adjudicate()
+    if r == 0:
         return 0.5
     return 1.0 if r > 0 else 0.0
 

@@ -108,6 +108,9 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
                 node.terminal = True
                 r = env.result()
                 leaf_value_white_pov = r if r is not None else 0.0
+            elif env.isRepetition() or env.isFiftyMove():
+                node.terminal = True
+                leaf_value_white_pov = 0.0          # threefold -> draw
             else:
                 priors, value = evaluate(net, env, legal)
                 leaf_value_white_pov = value if env.board.sideToMove == "white" else -value
