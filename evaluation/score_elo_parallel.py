@@ -22,8 +22,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 
-from arena import make_agent, match
-from score_elo import discover_checkpoints, fit_elo, load_cache, append_cache
+from evaluation.arena import make_agent, match
+from evaluation.score_elo import discover_checkpoints, fit_elo, load_cache, append_cache
 
 
 def _fmt(secs):

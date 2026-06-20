@@ -2,9 +2,9 @@ import math
 import torch
 import numpy as np
 
-from encoding import encode
-from move_encoding import encodeMove, NUM_ACTIONS
-from moves import Move
+from model.encoding import encode
+from model.move_encoding import encodeMove, NUM_ACTIONS
+from engine.moves import Move
 
 def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
     """

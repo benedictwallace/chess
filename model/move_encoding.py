@@ -1,4 +1,4 @@
-from moves import Move
+from engine.moves import Move
 
 DIRECTIONS = [
     (1, 0),   # N

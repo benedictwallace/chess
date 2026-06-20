@@ -28,7 +28,7 @@ import random
 
 import torch
 
-from arena import make_agent, match
+from evaluation.arena import make_agent, match
 
 
 # --------------------------------------------------------------------------- #

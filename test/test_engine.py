@@ -16,8 +16,8 @@ Run:  python test_engine.py
 import random
 import traceback
 
-from board import Board, perft
-from moves import Move, knightMoves, kingMoves, KNIGHT_ATTACKS, KING_ATTACKS, PAWN_ATTACKS
+from engine.board import Board, perft
+from engine.moves import Move, knightMoves, kingMoves, KNIGHT_ATTACKS, KING_ATTACKS, PAWN_ATTACKS
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +233,7 @@ def test_tactics():
 def test_arena():
     section("arena Elo math + accounting")
     try:
-        import arena
+        import evaluation.arena as arena
     except Exception as e:
         print(f"  SKIP (could not import arena: {e})")
         return

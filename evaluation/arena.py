@@ -4,9 +4,9 @@ import random
 
 import torch
 
-from gameEnv import Chess
-from network import ChessNet
-from puct import search, select_move
+from engine.gameEnv import Chess
+from model.network import ChessNet
+from search.puct import search, select_move
 
 PIECE_VALUES = {"pawn": 1, "knight": 3, "bishop": 3, "rook": 5, "queen": 9, "king": 0}
 

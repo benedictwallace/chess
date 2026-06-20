@@ -1,7 +1,7 @@
 
 import math
 import random
-from gameEnv import Chess
+from engine.gameEnv import Chess
 
 
 

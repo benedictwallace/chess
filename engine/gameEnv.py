@@ -1,5 +1,5 @@
-from moves import Move
-from board import Board
+from engine.moves import Move
+from engine.board import Board
 
 State = tuple
 

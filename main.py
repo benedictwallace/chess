@@ -4,9 +4,9 @@ import time
 import numpy as np
 import torch
 
-from network import ChessNet
-from self_play_parallel import generate_games_parallel
-from train import ReplayBuffer, train_epoch
+from model.network import ChessNet
+from training.self_play_parallel import generate_games_parallel
+from training.train import ReplayBuffer, train_epoch
 
 torch._inductor.config.compile_threads = 1
 torch.backends.cudnn.benchmark = True

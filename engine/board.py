@@ -1,11 +1,11 @@
 import copy
 
-from bitboard import (
+from engine.bitboard import (
     bb_from_string, bb_to_string, lsb,
     mustBeEmptyKwhite, mustBeEmptyQwhite,
     mustBeEmptyKblack, mustBeEmptyQblack,
 )
-from moves import (
+from engine.moves import (
     Move,
     knightMoves, getKnightMoves,
     rookMoves, getRookMoves,

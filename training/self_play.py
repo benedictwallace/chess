@@ -16,10 +16,10 @@ steer search.
 
 import numpy as np
 
-from gameEnv import Chess
-from encoding import encode
-from move_encoding import encodeMove, NUM_ACTIONS
-from puct import search, select_move
+from engine.gameEnv import Chess
+from model.encoding import encode
+from model.move_encoding import encodeMove, NUM_ACTIONS
+from search.puct import search, select_move
 
 
 def _policy_target(visit_counts):

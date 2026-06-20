@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from move_encoding import NUM_ACTIONS
+from model.move_encoding import NUM_ACTIONS
 
 NUM_PLANES = 18
 

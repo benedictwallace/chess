@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from bitboard import lsb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
+from engine.bitboard import lsb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
 
 @dataclass(frozen=True)
 class Move:

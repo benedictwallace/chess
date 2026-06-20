@@ -1,15 +1,15 @@
-from gameEnv import Chess
-from moves import Move
-from board import Board, perft
-from encoding import encode
+from engine.gameEnv import Chess
+from engine.moves import Move
+from engine.board import Board, perft
+from model.encoding import encode
 import numpy as np
-from network import ChessNet
+from model.network import ChessNet
 import torch
-from move_encoding import encodeMove, decodeMove, NUM_ACTIONS
-from puct import search
+from model.move_encoding import encodeMove, decodeMove, NUM_ACTIONS
+from search.puct import search
 import os
-from self_play import generate_games
-from train import ReplayBuffer, train_epoch
+from training.self_play import generate_games
+from training.train import ReplayBuffer, train_epoch
 
 def testGPU():
     import torch
@@ -161,9 +161,9 @@ def testBoard():
 
 def testOneMoveMate():
     print("\n--- One-move-mate test (back-rank) ---")
-    from board import Board
-    from gameEnv import Chess
-    from moves import Move
+    from engine.board import Board
+    from engine.gameEnv import Chess
+    from engine.moves import Move
 
     b = Board()
     for k in b.bb:
