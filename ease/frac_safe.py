@@ -62,6 +62,29 @@ class FracSafeEase:
         q_best = max(qs)
         return sum(q >= q_best - self.delta for q in qs) / len(qs)
 
+    def explain(self, root) -> dict:
+        """
+        Diagnostics behind local(root): the well-visited move Qs, the best Q,
+        the safety threshold, and how many moves clear it. Optional hook used by
+        the evaluation tool; not needed for training.
+        """
+        qs = sorted((c.value / c.visits for c in root.children if c.visits >= self.min_visits),
+                    reverse=True)
+        if len(qs) < 2:
+            return {"defined": False, "n_considered": len(qs), "qs": qs}
+        q_best = qs[0]
+        threshold = q_best - self.delta
+        n_safe = sum(q >= threshold for q in qs)
+        return {
+            "defined": True,
+            "q_best": q_best,
+            "threshold": threshold,
+            "n_safe": n_safe,
+            "n_considered": len(qs),
+            "frac_safe": n_safe / len(qs),
+            "qs": qs,
+        }
+
     # ------------------------------------------------------------------ #
     # post-game aggregation into per-ply (target, mask)
     # ------------------------------------------------------------------ #
