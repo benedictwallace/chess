@@ -45,7 +45,9 @@ def evaluate(net, env, legal=None):
         x = x.to(next(net.parameters()).device)
         net.eval()
         with torch.no_grad():
-            policy_logits, value_tensor = net(x)
+            out = net(x)
+        # ignore any aux heads (out[2:], e.g. ease): search needs policy+value only
+        policy_logits, value_tensor = out[0], out[1]
         logits = policy_logits.squeeze(0).cpu()
         value = float(value_tensor.item())
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
+
 class ReplayBuffer:
     def __init__(self, capacity=50_000):
         self.buffer = deque(maxlen=capacity)
@@ -21,29 +22,28 @@ class ReplayBuffer:
         return random.sample(self.buffer, n)
 
 
-def _collate(batch, device):
+def _collate(batch, device, aux_ease=False):
     """
-    Each example:
-      (planes, policy, value, ease, ease_mask, cliff, cliff_mask, stab, stab_mask)
+    Examples are (planes, policy, value) or, with aux_ease,
+    (planes, policy, value, ease_target, ease_mask).
     """
     planes = np.stack([b[0] for b in batch])               # (B,18,8,8)
     policy = np.stack([b[1] for b in batch])               # (B,NUM_ACTIONS)
     value  = np.array([b[2] for b in batch], np.float32)   # (B,)
-    # ease   = np.array([b[3] for b in batch], np.float32)
-    # emask  = np.array([b[4] for b in batch], np.float32)
-    # cliff  = np.array([b[5] for b in batch], np.float32)
-    # cmask  = np.array([b[6] for b in batch], np.float32)
-    # stab   = np.array([b[7] for b in batch], np.float32)
-    # smask  = np.array([b[8] for b in batch], np.float32)
 
     t = lambda a: torch.from_numpy(a).to(device)
     planes = t(planes)
     policy = t(policy)
     value  = t(value).unsqueeze(1)
-    # ease   = t(ease).unsqueeze(1);  emask = t(emask).unsqueeze(1)
-    # cliff  = t(cliff).unsqueeze(1);  cmask = t(cmask).unsqueeze(1)
-    # stab   = t(stab).unsqueeze(1);  smask = t(smask).unsqueeze(1)
-    return planes, policy, value
+
+    if not aux_ease:
+        return planes, policy, value
+
+    ease  = np.array([b[3] for b in batch], np.float32)
+    emask = np.array([b[4] for b in batch], np.float32)
+    ease  = t(ease).unsqueeze(1)
+    emask = t(emask).unsqueeze(1)
+    return planes, policy, value, ease, emask
 
 
 def _masked_mse(pred, target, mask):
@@ -51,16 +51,15 @@ def _masked_mse(pred, target, mask):
 
 
 def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
-                ease_weight=1.0, cliff_weight=1.0, stab_weight=1.0):
+                aux_ease=False, ease_weight=1.0):
     """
-    Run gradient steps. Returns a dict of mean losses:
-      {total, policy, value, ease, cliff, stab}
+    Run gradient steps. Returns mean losses {total, policy, value, ease}.
+    With aux_ease=False this is the original policy+value training (ease stays 0).
     """
-
     scaler = GradScaler("cuda")
 
     net.train()
-    acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0, cliff=0.0, stab=0.0)
+    acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0)
     actual = 0
 
     for _ in range(batches):
@@ -68,39 +67,37 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             break
 
         batch = buffer.sample(batch_size)
-        (planes, policy_t, value_t,
-         # ease_t, emask, cliff_t, cmask, stab_t, smask
-         ) = _collate(batch, device)
-        
+        collated = _collate(batch, device, aux_ease=aux_ease)
+        if aux_ease:
+            planes, policy_t, value_t, ease_t, emask = collated
+        else:
+            planes, policy_t, value_t = collated
+
         optimiser.zero_grad()
 
         with autocast(device_type="cuda"):
-            policy_logits, value_p = net(planes)
-            # , ease_p, cliff_p, stab_p
-            
+            out = net(planes)
+            policy_logits, value_p = out[0], out[1]
+
             log_probs = F.log_softmax(policy_logits, dim=1)
             policy_loss = -(policy_t * log_probs).sum(dim=1).mean()
             value_loss = F.mse_loss(value_p, value_t)
-            # ease_loss = _masked_mse(ease_p, ease_t, emask)
-            # cliff_loss = _masked_mse(cliff_p, cliff_t, cmask)
-            # stab_loss = _masked_mse(stab_p, stab_t, smask)
+            loss = policy_loss + value_loss
 
-            loss = (policy_loss + value_loss
-                    # + ease_weight * ease_loss
-                    # + cliff_weight * cliff_loss
-                    # + stab_weight * stab_loss
-            )
+            if aux_ease:
+                ease_p = out[2]
+                ease_loss = _masked_mse(ease_p, ease_t, emask)
+                loss = loss + ease_weight * ease_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimiser)
-        scaler.update() 
+        scaler.update()
 
         acc["total"] += loss.item()
         acc["policy"] += policy_loss.item()
         acc["value"] += value_loss.item()
-        # acc["ease"] += ease_loss.item()
-        # acc["cliff"] += cliff_loss.item()
-        # acc["stab"] += stab_loss.item()
+        if aux_ease:
+            acc["ease"] += ease_loss.item()
         actual += 1
 
     if actual == 0:

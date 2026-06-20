@@ -63,19 +63,20 @@ def gpu_batcher_loop(net, request_queue, response_pipes, stop_event, batch_size=
         with torch.no_grad():
             if use_amp:
                 with torch.autocast("cuda"):
-                    policy_logits, value_tensor = net(batch_x)
+                    out = net(batch_x)
             else:
-                policy_logits, value_tensor = net(batch_x)
-        
-        policy_logits = policy_logits.cpu().numpy()
-        value_tensor = value_tensor.cpu().numpy()
+                out = net(batch_x)
+        # out[2:] (ease/aux heads) is ignored: search only needs policy+value,
+        # and ease targets are derived from the search tree, not the net.
+        policy_logits = out[0].cpu().numpy()
+        value_tensor = out[1].cpu().numpy()
         
         for idx, worker_id in enumerate(worker_ids):
             response_pipes[worker_id].send((policy_logits[idx], float(value_tensor[idx, 0])))
 
 
 def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, response_pipe, 
-                          iterations, max_plies, temp_moves, c):
+                          iterations, max_plies, temp_moves, c, ease_signal=None):
     """
     Worker process loop: pin to one thread and run asynchronous searches.
     """
@@ -91,7 +92,8 @@ def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, res
             break
             
         try:
-            game_examples = play_game(evaluator, iterations, max_plies, temp_moves, c)
+            game_examples = play_game(evaluator, iterations, max_plies, temp_moves, c,
+                                      ease_signal=ease_signal)
         except Exception:
             # A crashed worker must STILL report something, or the collector
             # blocks forever on result_queue.get(), stop_event is never set,
@@ -104,7 +106,8 @@ def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, res
 
 
 def generate_games_parallel(net, num_games, iterations=100, max_plies=200,
-                            temp_moves=30, c=1.5, workers=None, verbose=True):
+                            temp_moves=30, c=1.5, workers=None, verbose=True,
+                            ease_signal=None):
     """
     Generates parallel games while executing the GPU model inference exclusively
     on the main execution thread to preserve CUDA Graph context.
@@ -136,7 +139,7 @@ def generate_games_parallel(net, num_games, iterations=100, max_plies=200,
         p = ctx.Process(
             target=_worker_process_loop,
             args=(worker_id, task_queue, result_queue, request_queue, response_pipes_child[worker_id],
-                  iterations, max_plies, temp_moves, c)
+                  iterations, max_plies, temp_moves, c, ease_signal)
         )
         p.start()
         processes.append(p)
