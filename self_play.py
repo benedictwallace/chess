@@ -95,11 +95,11 @@ def _trajectory_stability(values, t, horizon, scale=2.0):
 def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
               ease_min_visits=5, ease_delta=0.1,
               cliff_gamma=0.9, stab_horizon=8):
-    """Play one self-game; return training examples (9-tuples)."""
+    """Play one self-game; return training examples (3-tuples)."""
     env = Chess()
     env.reset()
 
-    # history rows: (planes, policy, mover_sign, ease, ease_mask, cliff, cliff_mask, v_white)
+    # history rows: (planes, policy, mover_sign, v_white)
     history = []
 
     ply = 0
@@ -137,7 +137,8 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
     else:
         result_white_pov = result
 
-    values = [row[7] for row in history]        # white-POV value per ply
+    # FIX: Point index to 3 instead of 7 since history tuple was shortened
+    values = [row[3] for row in history]        # white-POV value per ply
 
     examples = []
     for t, (planes, policy_target, mover_sign, _v) in enumerate(history):

@@ -8,11 +8,12 @@ from network import ChessNet
 from self_play_parallel import generate_games_parallel
 from train import ReplayBuffer, train_epoch
 
+torch._inductor.config.compile_threads = 1
 torch.backends.cudnn.benchmark = True
 
 CONFIG = dict(
     # network
-    channels=96,
+    channels=128,
     num_blocks=8,
 
     # outer loop
@@ -20,7 +21,7 @@ CONFIG = dict(
 
     # self-play
     games_per_iter=24,
-    search_iterations=300,     # PUCT iterations per move
+    search_iterations=400,     # PUCT iterations per move
     max_plies=200,
     temp_moves=30,
 
@@ -119,7 +120,12 @@ def main(cfg=CONFIG):
         metrics_f.flush()
 
         # ---- checkpoint saving ----
-        ckpt = {"iteration": it, "model_state": net.state_dict(),
+        # net is torch.compile()'d, which (on most PyTorch versions) prefixes
+        # state_dict keys with "_orig_mod.". arena.load_net loads with
+        # strict=False, so a prefix mismatch would silently load ZERO weights
+        # and evaluate a random network. Save the unwrapped module's keys.
+        save_net = getattr(net, "_orig_mod", net)
+        ckpt = {"iteration": it, "model_state": save_net.state_dict(),
                 "optim_state": optimiser.state_dict(), "config": cfg}
 
         # always overwrite "latest" so resuming is trivial

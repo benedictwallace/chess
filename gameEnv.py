@@ -29,11 +29,20 @@ class Chess:
         self.halfmove_clock = 0
         return self.board.stateKey()
 
-    def step(self, move: Move) -> tuple[State, float, bool]:
+    def step(self, move: Move) -> State:
         """
-        Play a move. Reward is from the perspective of the player who just moved:
-        1.0 for delivering checkmate, 0.0 otherwise (incl. draws).
-        Returns (next state, reward, done).
+        Apply a move and update repetition / 50-move bookkeeping. Returns the
+        new state key.
+
+        NOTE: this deliberately does NOT compute terminality or a reward.
+        During MCTS selection `step` is called for every node on the descent
+        path, and the old checkmate/stalemate probe ran a full legal-move
+        generation on each of those -- the single biggest self-play cost --
+        only for the result to be discarded (every caller ignores step's return
+        and derives terminality via isTerminal()/result() where it actually
+        matters). Returning only the key (rather than a stale done=False) means
+        any future caller expecting the old 3-tuple fails loudly instead of
+        silently reading a wrong flag.
         """
         mover = self.board.sideToMove
 
@@ -50,15 +59,7 @@ class Chess:
 
         key = self.board.stateKey()
         self.counts[key] = self.counts.get(key, 0) + 1
-
-        done = self._terminal_for_key(key)
-        if done:
-            opponent = "black" if mover == "white" else "white"
-            reward = 1.0 if self.board.checkMate(opponent) else 0.0
-        else:
-            reward = 0.0
-
-        return key, reward, done
+        return key
 
     def legalMoves(self) -> list[Move]:
         return self.board.legalMoves(self.board.sideToMove)

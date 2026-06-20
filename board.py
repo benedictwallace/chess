@@ -2,10 +2,8 @@ import copy
 
 from bitboard import (
     bb_from_string, bb_to_string, lsb,
-    mustBeEmptyKwhite, mustBeEmptyQwhite, 
-    cantBeAttackedKwhite, cantBeAttackedQwhite, 
-    mustBeEmptyKblack, cantBeAttackedKblack,
-    mustBeEmptyQblack, cantBeAttackedQblack,
+    mustBeEmptyKwhite, mustBeEmptyQwhite,
+    mustBeEmptyKblack, mustBeEmptyQblack,
 )
 from moves import (
     Move,
@@ -210,23 +208,22 @@ class Board:
         if colour == "white":
             ownPieces = self.whitePieces
             oppPieces = self.blackPieces
-            
-            oppColour = "black"
         else:
             ownPieces = self.blackPieces
             oppPieces = self.whitePieces
-            
-            oppColour = "white"
 
-        oppAttacks = self.getAttackedSq(oppColour)
         moves = []
         moves += getKnightMoves(self.bb[colour, "knight"], ownPieces)
         moves += getRookMoves(self.bb[colour, "rook"], ownPieces=ownPieces, allPieces=self.allPieces)
         moves += getBishopMoves(self.bb[colour, "bishop"], ownPieces=ownPieces, allPieces=self.allPieces)
         moves += getQueenMoves(self.bb[colour, "queen"], ownPieces=ownPieces, allPieces=self.allPieces)
-        moves += getKingMoves(self.bb[colour, "king"], ownPieces=ownPieces, attackBB=oppAttacks)
+        # King moves are generated WITHOUT an attack mask (attackBB=0): the
+        # make/unmake legality filter in legalMoves() already rejects any king
+        # move that walks into check, so pre-masking here just duplicated a
+        # full-board getAttackedSq() sweep on every single legalMoves() call.
+        moves += getKingMoves(self.bb[colour, "king"], ownPieces=ownPieces, attackBB=0)
         moves += getPawnMoves(self.bb[colour, "pawn"], ownPieces=ownPieces, allPieces=self.allPieces, oppPieces=oppPieces, colour=colour, enPassantSq=self.enPassantSq)
-        moves += self.getCastles(colour=colour, attacksBB=oppAttacks)
+        moves += self.getCastles(colour)
         return moves
     
     def updatePieces(self):
@@ -284,25 +281,41 @@ class Board:
         
         return attacked
 
-    def getCastles(self, colour: str, attacksBB) -> list[Move]:
+    def getCastles(self, colour: str) -> list[Move]:
+        """
+        Castling moves. Attack checks are done lazily with targeted
+        squareAttackedBy() calls (which early-exit) on exactly the king's
+        start/transit/destination squares, and ONLY when castling rights plus
+        the empty-square requirement are already satisfied. In the common case
+        (no rights, or blocked) this returns immediately without touching the
+        opponent's attack set at all -- replacing the old full getAttackedSq()
+        sweep that ran on every move generation.
+
+        The squares tested match the old cantBeAttacked* bitboards exactly, so
+        the legal set (and perft) is unchanged.
+        """
         moves = []
 
-
         if colour == "white":
-
-            if self.whiteKCastle and not (self.allPieces & mustBeEmptyKwhite) and not (attacksBB & cantBeAttackedKwhite):
-                moves.append(Move(fromSq = 4, toSq = 6, castle = True))
-
-            if self.whiteQCastle and not (self.allPieces & mustBeEmptyQwhite) and not (attacksBB & cantBeAttackedQwhite):
-                moves.append(Move(fromSq = 4, toSq = 2, castle = True))
-
+            kingside = self.whiteKCastle and not (self.allPieces & mustBeEmptyKwhite)
+            queenside = self.whiteQCastle and not (self.allPieces & mustBeEmptyQwhite)
+            if not (kingside or queenside):
+                return moves
+            opp = "black"
+            if kingside and not any(self.squareAttackedBy(sq, opp) for sq in (4, 5, 6)):
+                moves.append(Move(fromSq=4, toSq=6, castle=True))
+            if queenside and not any(self.squareAttackedBy(sq, opp) for sq in (4, 3, 2)):
+                moves.append(Move(fromSq=4, toSq=2, castle=True))
         else:
-
-            if self.blackKCastle and not (self.allPieces & mustBeEmptyKblack) and not (attacksBB & cantBeAttackedKblack):
-                moves.append(Move(fromSq = 60, toSq = 62, castle = True))
-
-            if self.blackQCastle and not (self.allPieces & mustBeEmptyQblack) and not (attacksBB & cantBeAttackedQblack):
-                moves.append(Move(fromSq = 60, toSq = 58, castle = True))
+            kingside = self.blackKCastle and not (self.allPieces & mustBeEmptyKblack)
+            queenside = self.blackQCastle and not (self.allPieces & mustBeEmptyQblack)
+            if not (kingside or queenside):
+                return moves
+            opp = "white"
+            if kingside and not any(self.squareAttackedBy(sq, opp) for sq in (60, 61, 62)):
+                moves.append(Move(fromSq=60, toSq=62, castle=True))
+            if queenside and not any(self.squareAttackedBy(sq, opp) for sq in (60, 59, 58)):
+                moves.append(Move(fromSq=60, toSq=58, castle=True))
 
         return moves
 

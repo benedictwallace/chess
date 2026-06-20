@@ -20,9 +20,9 @@ def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
         child.prior = (1 - frac) * child.prior + frac*n
 
 
-
 def evaluate(net, env, legal=None):
     """Run the network on the current position.
+    Supports standard PyTorch Modules or RemoteEvaluator proxies interchangeably.
     Returns (priors, value):
         priors: dict {Move: probability} over LEGAL moves only
         value:  float in [-1, 1], from the mover's perspective
@@ -34,25 +34,30 @@ def evaluate(net, env, legal=None):
         return {}, 0.0
 
     planes = encode(board)
-    x = torch.from_numpy(planes).unsqueeze(0) # (1, 18, 8, 8)
-    x = x.to(next(net.parameters()).device)
     
-    net.eval()
-
-    with torch.no_grad():
-        policy_logits, value_tensor = net(x)
-        
-    logits = policy_logits.squeeze(0)
-    value = float(value_tensor.item())
+    # Intercept evaluation if utilizing centralized process batching
+    if hasattr(net, "is_proxy") and net.is_proxy:
+        policy_logits_np, value = net.evaluate_remote(planes)
+        logits = torch.from_numpy(policy_logits_np)
+    else:
+        # Standard structural fallback execution path
+        x = torch.from_numpy(planes).unsqueeze(0) # (1, 18, 8, 8)
+        x = x.to(next(net.parameters()).device)
+        net.eval()
+        with torch.no_grad():
+            policy_logits, value_tensor = net(x)
+        logits = policy_logits.squeeze(0).cpu()
+        value = float(value_tensor.item())
 
     legal_indices = [encodeMove(m) for m in legal]
     
-    # 2. FIX THE PYTHON LOOP: Use native vectorized advanced indexing
+    # Advanced vectorized advanced indexing optimization
     legal_logits = logits[legal_indices] 
     probs = torch.softmax(legal_logits, dim=0)
     
     priors = {m: float(probs[i].item()) for i, m in enumerate(legal)}
     return priors, value
+
 
 class Node:
     def __init__(self, parent=None, move=None, prior=0.0):
@@ -65,6 +70,7 @@ class Node:
         self.moverSign = 0
         self.terminal = False
         self.expanded = False 
+
 
 def puctScore(child, parent, c=1.5):
     """
@@ -81,7 +87,7 @@ def puctScore(child, parent, c=1.5):
 def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
                noise_frac=0.25) -> tuple[Node, dict[Move, int]]:
     """
-    
+    Executes MCTS iteration steps.
     """
     root = Node()
     root.moverSign = 0
@@ -91,17 +97,14 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
         env = rootEnv.clone()
         path = [node]
 
-
         # 1. SELECTION: descend via PUCT until an unexpanded or terminal node
         while node.expanded and not node.terminal and node.children:
             node = max(node.children, key=lambda ch: puctScore(ch, node, c))
             env.step(node.move)
             path.append(node)
 
-
         # 2. EXPANSION + EVALUATION
         if node.terminal:
-            # use the true game result, not the network
             r = env.result()
             leaf_value_white_pov = r if r is not None else 0.0
         else:
@@ -112,7 +115,7 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
                 leaf_value_white_pov = r if r is not None else 0.0
             elif env.isRepetition() or env.isFiftyMove():
                 node.terminal = True
-                leaf_value_white_pov = 0.0          # threefold -> draw
+                leaf_value_white_pov = 0.0
             else:
                 priors, value = evaluate(net, env, legal)
                 leaf_value_white_pov = value if env.board.sideToMove == "white" else -value
@@ -125,7 +128,7 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
                 if add_noise and node is root:
                     _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
 
-        # 3. BACKPROP
+        # 3. BACKPROPATION
         for n in path:
             n.visits += 1
             n.value += leaf_value_white_pov * n.moverSign
@@ -133,11 +136,10 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
     visit_counts = {ch.move: ch.visits for ch in root.children}
     return root, visit_counts
 
+
 def select_move(visit_counts, temp=1.0):
     """
-    choose move from root visit counts.
-    Args:
-        visit_counts: dict[Move, int]
+    Choose move from root visit counts.
     """
     moves = list(visit_counts.keys())
     counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)

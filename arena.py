@@ -179,7 +179,21 @@ def load_net(path, device):
     cfg = ckpt.get("config", {})
     net = ChessNet(channels=cfg.get("channels", 64),
                    num_blocks=cfg.get("num_blocks", 5))
-    net.load_state_dict(ckpt["model_state"], strict=False)
+    state = ckpt["model_state"]
+    # tolerate a stray torch.compile "_orig_mod." prefix in older checkpoints
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+    # strict=False so removed aux heads (ease/cliff/stab) don't error -- but
+    # check the result, or a total key mismatch silently loads a RANDOM net.
+    incompat = net.load_state_dict(state, strict=False)
+    core_missing = [k for k in incompat.missing_keys
+                    if k.startswith(("stem.", "blocks.", "policy_", "value_"))]
+    if core_missing:
+        raise RuntimeError(
+            f"{path}: {len(core_missing)} core weights missing after load "
+            f"(e.g. {core_missing[:3]}). Checkpoint/architecture mismatch -- "
+            f"refusing to evaluate an effectively random net."
+        )
     net.to(device).eval()
     return net
 
