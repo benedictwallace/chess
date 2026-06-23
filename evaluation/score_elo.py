@@ -137,7 +137,9 @@ def main():
         spec[a] = a
     players = anchors + ckpt_names
     print(f"{len(ckpts)} checkpoints, anchors={anchors}, "
-          f"{args.games} games/match, {args.iterations} sims/move\n")
+          f"{args.games} games/match, {args.iterations} sims/move, device={device}")
+    print("(serial: one game at a time = batch-1 GPU forwards; use "
+          "score_elo_parallel for batched-GPU throughput)\n")
 
     # build each agent once and reuse across matches
     agents = {name: make_agent(spec[name], device, rng,

@@ -211,6 +211,47 @@ def make_agent(spec, device, rng, iterations, c, opening_plies):
     return NeuralAgent(net, iterations, c, opening_plies)
 
 
+# --------------------------------------------------------------------------- #
+# Remote (batched-GPU) player construction
+# --------------------------------------------------------------------------- #
+class RemoteEvaluator:
+    """
+    A stand-in 'net' for worker processes. Instead of running a network locally,
+    it ships (worker_id, net_id, planes) to the central GPU batcher and blocks
+    for the (policy_logits, value) reply. It duck-types exactly what puct.evaluate
+    needs: the `is_proxy` flag plus an `evaluate_remote(planes)` method, so neither
+    `search`, `NeuralAgent`, nor `match` need any changes.
+
+    `net_id` tells the batcher WHICH network to run -- this is what lets one batcher
+    serve many different checkpoints at once (a checkpoint path, or 'untrained').
+    """
+    is_proxy = True
+
+    def __init__(self, net_id, worker_id, request_queue, response_pipe):
+        self.net_id = net_id
+        self.worker_id = worker_id
+        self.request_queue = request_queue
+        self.response_pipe = response_pipe
+
+    def evaluate_remote(self, planes):
+        self.request_queue.put((self.worker_id, self.net_id, planes))
+        return self.response_pipe.recv()      # (policy_logits_np, value_float)
+
+
+def make_remote_agent(spec, net_id, worker_id, request_queue, response_pipe,
+                      rng, iterations, c, opening_plies):
+    """
+    Like make_agent, but neural players are backed by a RemoteEvaluator proxy
+    instead of a local net. Anchors (random/material) need no net and are built
+    locally in the worker. `net_id` is the key the batcher uses to pick the net
+    (use the checkpoint path, or 'untrained').
+    """
+    if spec == "random":
+        return RandomAgent(rng)
+    if spec == "material":
+        return MaterialAgent(rng)
+    proxy = RemoteEvaluator(net_id, worker_id, request_queue, response_pipe)
+    return NeuralAgent(proxy, iterations, c, opening_plies)
 
 
 def main():
