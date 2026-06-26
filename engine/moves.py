@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from engine.bitboard import lsb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
+from engine.bitboard import lsb, msb, BOARD, notAfile, notBfile, notGfile, notHfile, rank1, rank2, rank7, rank8
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Move:
     fromSq: int
     toSq: int
@@ -49,33 +49,74 @@ def getKnightMoves(knightsBB: int, ownPieces: int) -> list[Move]:
     
     return moves
 
-def rookMoves(square: int, ownPieces: int, allPieces: int) -> int:
+# ---------------------------------------------------------------------------
+# Sliding-piece attacks via precomputed rays.
+#
+# For every square and every one of the 8 directions we precompute the ray
+# bitboard (all squares from that square outward to the edge). An attack along a
+# ray with occupancy `occ` is then:
+#     ray, mask off everything beyond the first blocker.
+# The first blocker is the lsb of (ray & occ) for "positive" directions (those
+# heading to higher square indices: N, E, NE, NW) and the msb for "negative"
+# ones (S, W, SE, SW). Masking beyond it is a single `& ~RAYS[blocker][dir]`.
+# This replaces the old per-square Python stepping loop (and its millions of
+# wrap-around abs() checks) with at most 4 iterations of pure bit ops, while
+# producing the IDENTICAL attack set (verified by perft).
+#
+# `& ~ownPieces` at the call sites drops own-occupied destination squares; with
+# ownPieces=0 (attack-map / squareAttackedBy callers) the blocker square itself
+# stays set, which is correct -- an occupied square is attacked/defended.
+# ---------------------------------------------------------------------------
+
+# (dRank, dFile, isPositive)  -- isPositive => nearest blocker is the lsb
+_RAY_DIRS = [
+    ( 1,  0, True),   # N
+    (-1,  0, False),  # S
+    ( 0,  1, True),   # E
+    ( 0, -1, False),  # W
+    ( 1,  1, True),   # NE
+    ( 1, -1, True),   # NW
+    (-1,  1, False),  # SE
+    (-1, -1, False),  # SW
+]
+_ROOK_DIR_IDX = (0, 1, 2, 3)
+_BISHOP_DIR_IDX = (4, 5, 6, 7)
+_QUEEN_DIR_IDX = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def _build_ray(square: int, dRank: int, dFile: int) -> int:
+    bb = 0
+    r, f = square // 8, square % 8
+    while True:
+        r += dRank
+        f += dFile
+        if not (0 <= r < 8 and 0 <= f < 8):
+            break
+        bb |= 1 << (r * 8 + f)
+    return bb
+
+# RAYS[square][dirIdx] = ray bitboard. _RAY_POS[dirIdx] = isPositive flag.
+RAYS = [[_build_ray(sq, dr, df) for (dr, df, _pos) in _RAY_DIRS] for sq in range(64)]
+_RAY_POS = [pos for (_dr, _df, pos) in _RAY_DIRS]
+
+
+def _slide_attacks(square: int, occ: int, dir_idxs) -> int:
     attacks = 0
-
-    for direction in [1, -1, 8, -8]:
-
-        current = square
-
-        while True:
-            prevFile = current % 8
-            current += direction
-
-            if current > 63 or current < 0:
-                break
-
-            currFile = current % 8
-            if abs(currFile - prevFile) > 1: # wrap around on edges
-                break
-
-            if (ownPieces >> current) & 1: # Moves own pieces bb and checks if this is a 1 if there is a piece on current
-                break
-            
-            attacks |= (1 << current)
-
-            if (allPieces >> current) & 1:
-                break
-            
+    sq_rays = RAYS[square]
+    for d in dir_idxs:
+        ray = sq_rays[d]
+        blockers = ray & occ
+        if blockers:
+            nearest = lsb(blockers) if _RAY_POS[d] else msb(blockers)
+            # RAYS[nearest][d] is the tail of this ray (a subset), so XOR drops
+            # exactly the squares beyond the blocker, leaving up-to-&-incl. it.
+            ray ^= RAYS[nearest][d]
+        attacks |= ray
     return attacks
+
+
+def rookMoves(square: int, ownPieces: int, allPieces: int) -> int:
+    return _slide_attacks(square, allPieces, _ROOK_DIR_IDX) & ~ownPieces
 
 def getRookMoves(rooksBB: int, ownPieces: int, allPieces: int) -> list[Move]:
 
@@ -95,32 +136,7 @@ def getRookMoves(rooksBB: int, ownPieces: int, allPieces: int) -> list[Move]:
     return moves
 
 def bishopMoves(square: int, ownPieces: int, allPieces: int) -> int:
-    attacks = 0
-
-    for direction in [7, -7, 9, -9]:
-
-        current = square
-
-        while True:
-            prevFile = current % 8
-            current += direction
-
-            if current > 63 or current < 0:
-                break
-
-            currFile = current % 8
-            if abs(currFile - prevFile) > 1: # wrap around on edges
-                break
-
-            if (ownPieces >> current) & 1: # Moves own pieces bb and checks if this is a 1 if there is a piece on current
-                break
-            
-            attacks |= (1 << current)
-
-            if (allPieces >> current) & 1:
-                break
-            
-    return attacks
+    return _slide_attacks(square, allPieces, _BISHOP_DIR_IDX) & ~ownPieces
 
 def getBishopMoves(bishopsBB: int, ownPieces: int, allPieces: int) -> list[Move]:
 
@@ -139,8 +155,8 @@ def getBishopMoves(bishopsBB: int, ownPieces: int, allPieces: int) -> list[Move]
     
     return moves
 
-def queenMoves(square: int,ownPieces: int, allPieces: int) -> int:
-    return rookMoves(square, ownPieces, allPieces) | bishopMoves(square, ownPieces, allPieces)
+def queenMoves(square: int, ownPieces: int, allPieces: int) -> int:
+    return _slide_attacks(square, allPieces, _QUEEN_DIR_IDX) & ~ownPieces
 
 def getQueenMoves(queensBB: int, ownPieces: int, allPieces: int) -> list[Move]:
 

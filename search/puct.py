@@ -3,7 +3,7 @@ import torch
 import numpy as np
 
 from model.encoding import encode
-from model.move_encoding import encodeMove, NUM_ACTIONS
+from model.move_encoding import encodeMove, encodeMovePOV, NUM_ACTIONS
 from engine.moves import Move
 
 def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
@@ -45,18 +45,16 @@ def evaluate(net, env, legal=None):
         x = x.to(next(net.parameters()).device)
         net.eval()
         with torch.no_grad():
-            out = net(x)
-        # ignore any aux heads (out[2:], e.g. ease): search needs policy+value only
-        policy_logits, value_tensor = out[0], out[1]
+            policy_logits, value_tensor = net(x)
         logits = policy_logits.squeeze(0).cpu()
         value = float(value_tensor.item())
 
-    legal_indices = [encodeMove(m) for m in legal]
-    
+    legal_indices = [encodeMovePOV(m, board.sideToMove) for m in legal]
+
     # Advanced vectorized advanced indexing optimization
-    legal_logits = logits[legal_indices] 
+    legal_logits = logits[legal_indices]
     probs = torch.softmax(legal_logits, dim=0)
-    
+
     priors = {m: float(probs[i].item()) for i, m in enumerate(legal)}
     return priors, value
 

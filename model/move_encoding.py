@@ -30,6 +30,52 @@ def _rc(square):
     return square // 8, square % 8
 
 
+def _flip_sq_vertical(square: int) -> int:
+    """
+    Rank-only (vertical) flip of a square: rank r -> 7-r, FILE UNCHANGED.
+    Involution: _flip_sq_vertical(_flip_sq_vertical(s)) == s.
+    """
+    return (7 - (square >> 3)) * 8 + (square & 7)
+
+
+def flip_move_vertical(move: Move) -> Move:
+    """
+    Rank-only (vertical) flip of a move's squares (file preserved). Promotion,
+    castle and en-passant flags are carried through unchanged -- a vertical flip
+    maps a promotion to a promotion of the same piece, a castle to a castle, etc.
+    Used to move a Black move into / out of the side-to-move canonical frame.
+    """
+    return Move(
+        fromSq=_flip_sq_vertical(move.fromSq),
+        toSq=_flip_sq_vertical(move.toSq),
+        promotion=move.promotion,
+        castle=move.castle,
+        enPassant=move.enPassant,
+    )
+
+
+def encodeMovePOV(move: Move, sideToMove: str) -> int:
+    """
+    Encode a move in the MOVER's canonical frame, matching the rank-only flip
+    that model.encoding.encode applies to the input planes.
+
+      white -> identity (board already in absolute = mover frame)
+      black -> vertical-flip the squares first, so the mover's pawns advance
+               "up" the board and a policy index means the same thing it does
+               for white.
+
+    Because the board is only ever flipped on the rank axis, the existing
+    absolute encodeMove handles the flipped squares correctly: a vertical flip
+    negates the rank component of every queen/knight direction (each of which has
+    its negation already in the table) and leaves the file component (dC, used by
+    the underpromotion branch) untouched. The result is a bijection on legal
+    moves with no collisions -- see the tests.
+    """
+    if sideToMove == "black":
+        move = flip_move_vertical(move)
+    return encodeMove(move)
+
+
 def encodeMove(move: Move) -> int:
     fromR, fromC = _rc(move.fromSq)
     toR, toC = _rc(move.toSq)
@@ -65,7 +111,9 @@ def decodeMove(index: int) -> Move:
     fromR, fromC = _rc(fromSq)
 
     if moveType < 56:
-        # queen move
+        # queen-style slide. NOTE: queen PROMOTIONS live here too -- only
+        # under-promotions get their own planes, so a pawn promoting to a queen
+        # was encoded as a 1-step forward move onto the back rank.
         dirIdx = moveType // 7
         distance = (moveType % 7) + 1
         dR, dC = DIRECTIONS[dirIdx]
@@ -73,7 +121,19 @@ def decodeMove(index: int) -> Move:
         toC = fromC + dC * distance
         toSq = toR * 8 + toC
 
-        return Move(fromSq=fromSq, toSq=toSq)
+        # A single forward step landing on the last rank is a queen promotion.
+        # "Forward" depends on colour/frame exactly as in the under-promotion
+        # branch below (rank 7 -> promoting upward, rank 2 -> promoting downward).
+        # Marking it makes encodeMove <-> decodeMove an exact round-trip for queen
+        # promotions instead of silently dropping them. (A real queen sliding one
+        # square onto the back rank shares this index; in practice decode is only
+        # ever matched against the legal-move list, and only a pawn can promote,
+        # so the promotion reading is the intended one.)
+        promotion = None
+        if distance == 1 and ((fromR == 6 and dR == 1) or (fromR == 1 and dR == -1)):
+            promotion = "Q"
+
+        return Move(fromSq=fromSq, toSq=toSq, promotion=promotion)
 
     elif moveType < 64:
         # knight move
@@ -93,6 +153,3 @@ def decodeMove(index: int) -> Move:
         dR = 1 if fromR == 6 else -1   # rank 7 -> white promoting, rank 2 -> black
         toR, toC = fromR + dR, fromC + dC
         return Move(fromSq=fromSq, toSq=toR * 8 + toC, promotion=piece)
-
-
-

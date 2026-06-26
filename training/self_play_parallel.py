@@ -76,7 +76,7 @@ def gpu_batcher_loop(net, request_queue, response_pipes, stop_event, batch_size=
 
 
 def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, response_pipe, 
-                          iterations, max_plies, temp_moves, c, ease_signal=None):
+                          iterations, max_plies, temp_moves, c, adj_margin=5.0, adj_plies=20):
     """
     Worker process loop: pin to one thread and run asynchronous searches.
     """
@@ -93,7 +93,7 @@ def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, res
             
         try:
             game_examples = play_game(evaluator, iterations, max_plies, temp_moves, c,
-                                      ease_signal=ease_signal)
+                                      adj_margin=adj_margin, adj_plies=adj_plies)
         except Exception:
             # A crashed worker must STILL report something, or the collector
             # blocks forever on result_queue.get(), stop_event is never set,
@@ -107,7 +107,7 @@ def _worker_process_loop(worker_id, task_queue, result_queue, request_queue, res
 
 def generate_games_parallel(net, num_games, iterations=100, max_plies=200,
                             temp_moves=30, c=1.5, workers=None, verbose=True,
-                            ease_signal=None):
+                            adj_margin=5.0, adj_plies=20):
     """
     Generates parallel games while executing the GPU model inference exclusively
     on the main execution thread to preserve CUDA Graph context.
@@ -139,7 +139,7 @@ def generate_games_parallel(net, num_games, iterations=100, max_plies=200,
         p = ctx.Process(
             target=_worker_process_loop,
             args=(worker_id, task_queue, result_queue, request_queue, response_pipes_child[worker_id],
-                  iterations, max_plies, temp_moves, c, ease_signal)
+                  iterations, max_plies, temp_moves, c, adj_margin, adj_plies)
         )
         p.start()
         processes.append(p)

@@ -3,7 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model.move_encoding import NUM_ACTIONS
 
-NUM_PLANES = 18
+# Must match model.encoding.NUM_PLANES (the conv stem's in-channels = encoded
+# planes). 17 = 12 piece planes + 4 castling + 1 en passant; no side-to-move
+# plane, since the board is canonicalised to the mover's POV.
+NUM_PLANES = 17
 
 
 class ResidualBlock(nn.Module):
@@ -41,12 +44,8 @@ class ScalarHead(nn.Module):
 
 
 class ChessNet(nn.Module):
-    def __init__(self, channels=64, num_blocks=5, aux_ease=False):
+    def __init__(self, channels=64, num_blocks=5):
         super().__init__()
-        # aux_ease: when True, add a single record-only scalar head in [0,1]
-        # (trained on an "ease" target, e.g. frac-safe). Default False keeps the
-        # net's outputs and state_dict identical to the production 2-head net.
-        self.aux_ease = aux_ease
 
         self.stem = nn.Sequential(
             nn.Conv2d(NUM_PLANES, channels, 3, padding=1, bias=False),
@@ -68,9 +67,15 @@ class ChessNet(nn.Module):
         self.value_fc1 = nn.Linear(1 * 8 * 8, 64)
         self.value_fc2 = nn.Linear(64, 1)
 
-        # ease head -> record-only scalar in [0, 1] (only built when requested)
-        if self.aux_ease:
-            self.ease_head = ScalarHead(channels, torch.sigmoid)
+        # ease head -> forgiveness (frac_safe) in [0, 1]  (unchanged keys)
+        # self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
+        # self.ease_bn = nn.BatchNorm2d(1)
+        # self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
+        # self.ease_fc2 = nn.Linear(64, 1)
+
+        # # record-only heads, both in [0, 1]
+        # self.cliff_head = ScalarHead(channels, torch.sigmoid)  # cliff-size discounted return
+        # self.stab_head = ScalarHead(channels, torch.sigmoid)   # trajectory stability
 
     def forward(self, x):
         x = self.stem(x)
@@ -86,7 +91,12 @@ class ChessNet(nn.Module):
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
 
-        if self.aux_ease:
-            ease = self.ease_head(x)            # (B, 1) in [0, 1]
-            return policy_logits, value, ease
+        # e = F.relu(self.ease_bn(self.ease_conv(x)))
+        # e = e.reshape(e.size(0), -1)
+        # e = F.relu(self.ease_fc1(e))
+        # ease = torch.sigmoid(self.ease_fc2(e))
+
+        # cliff = self.cliff_head(x)
+        # stab = self.stab_head(x)
+
         return policy_logits, value

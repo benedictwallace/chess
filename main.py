@@ -3,9 +3,10 @@ import csv
 import time
 import numpy as np
 import torch
+from torch.amp import GradScaler
 
 from model.network import ChessNet
-from training.self_play_parallel import generate_games_parallel
+from training.self_play_batched import generate_games_batched
 from training.train import ReplayBuffer, train_epoch
 
 torch._inductor.config.compile_threads = 1
@@ -22,8 +23,35 @@ CONFIG = dict(
     # self-play
     games_per_iter=24,
     search_iterations=400,     # PUCT iterations per move
-    max_plies=200,
-    temp_moves=30,
+    max_plies=200,             # hard ply cap. With early adjudication enabled,
+                               # decided games stop well before this, so the cap
+                               # mainly bounds long *balanced* games -- raising it
+                               # just spends more self-play time there. Raise only
+                               # if you observe decided games being cut at the cap.
+    temp_moves=20,
+
+    # batched self-play. Games are played in one process and their MCTS leaf
+    # evaluations are batched together into a single GPU forward pass. `concurrency`
+    # is how many games run simultaneously and is the main lever on GPU batch size:
+    # the network sees batches of up to `concurrency` positions, versus <= workers
+    # tiny batches under the old per-eval multiprocess path. Set it as high as the
+    # forward pass fits in GPU memory; 64-256 is a good range for a 128x8 net.
+    concurrency=128,
+
+    # within-phase evaluation cache (transposition/repetition skip). Keyed by exact
+    # position; rebuilt each self-play phase (the net changes between iterations).
+    # Stores legal-move priors + value per entry (~a few KB); cache_cap bounds RAM
+    # (200k ~= 0.7 GB). Set use_cache=False to disable.
+    use_cache=True,
+    cache_cap=200_000,
+
+    # early adjudication ("resignation"): stop a game once one side has held a
+    # material lead of >= adj_margin for adj_plies consecutive plies, and score it
+    # for that side. Gives clearly-won games a clean +/-1 value target (instead of
+    # a noisy ply-cap snapshot) and removes the biggest self-play cost: grinding
+    # out already-won games. Set adj_plies=0 to disable.
+    adj_margin=5.0,            # 5 == 'up a rook'
+    adj_plies=20,              # consecutive plies the lead must hold
 
     # training
     buffer_capacity=200_000,
@@ -31,21 +59,18 @@ CONFIG = dict(
     batch_size=256,
     lr=1e-3,
     weight_decay=1e-4,
-    ease_weight=1.0,           # weight on the forgiveness (ease) loss
-    cliff_weight=1.0,          # weight on the cliff-return loss
-    stab_weight=1.0,           # weight on the trajectory-stability loss
 
     # io
-    workers=18,              # self-play processes; None = all cores
     checkpoint_dir="checkpoints",
-    checkpoint_every=10,
+    checkpoint_every=5,
     metrics_file="metrics.csv",
 )
 
 
 def main(cfg=CONFIG):
     """
-    Run the full self-play -> train -> checkpoint loop, logging all losses.
+    Run the baseline self-play -> train -> checkpoint loop (policy + value only),
+    logging the policy and value losses.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -53,12 +78,24 @@ def main(cfg=CONFIG):
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"])
     net.to(device)
 
-    net = torch.compile(net, mode="reduce-overhead")
+    # Default compile mode, NOT mode="reduce-overhead". reduce-overhead uses CUDA
+    # graphs, which require a static input shape and a stable train/eval mode. The
+    # batched self-play feeds a *variable* batch size (it shrinks from `concurrency`
+    # as the game pool drains, and cache/terminal hits trim it round to round) and
+    # we toggle net.train()/eval() every iteration, so a captured graph would be
+    # recaptured constantly -- pure overhead for a net this small. Default mode
+    # keeps the kernel fusion benefit without the cudagraph fragility.
+    net = torch.compile(net)
 
     optimiser = torch.optim.Adam(
         net.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
     )
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
+
+    # One persistent AMP loss scaler for the whole run. Recreating it each
+    # iteration would reset the online loss-scale calibration and re-run its
+    # warmup every time (occasionally skipping steps); see train_epoch.
+    scaler = GradScaler("cuda")
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
@@ -71,7 +108,6 @@ def main(cfg=CONFIG):
         writer.writerow([
             "iteration", "buffer_size",
             "loss_total", "loss_policy", "loss_value",
-            # "loss_ease", "loss_cliff", "loss_stab",
             "selfplay_sec", "train_sec",
         ])
         metrics_f.flush()
@@ -82,12 +118,16 @@ def main(cfg=CONFIG):
 
         print("self play")
         t0 = time.time()
-        examples = generate_games_parallel(
+        examples = generate_games_batched(
             net, cfg["games_per_iter"],
             iterations=cfg["search_iterations"],
             max_plies=cfg["max_plies"],
             temp_moves=cfg["temp_moves"],
-            workers=cfg["workers"],
+            concurrency=cfg["concurrency"],
+            adj_margin=cfg["adj_margin"],
+            adj_plies=cfg["adj_plies"],
+            use_cache=cfg["use_cache"],
+            cache_cap=cfg["cache_cap"],
         )
         selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
@@ -99,22 +139,17 @@ def main(cfg=CONFIG):
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
-            # ease_weight=cfg["ease_weight"],
-            # cliff_weight=cfg["cliff_weight"],
-            # stab_weight=cfg["stab_weight"],
+            scaler=scaler,
         )
         train_sec = time.time() - t0
 
         print(f"  loss total={losses['total']:.4f}  policy={losses['policy']:.4f}  "
-              f"value={losses['value']:.4f}  ease={losses['ease']:.4f}  "
-              #f"cliff={losses['cliff']:.4f}  stab={losses['stab']:.4f} " 
-              f"(train {train_sec:.1f}s)")
+              f"value={losses['value']:.4f}  (train {train_sec:.1f}s)")
 
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
             f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
-            #f"{losses['ease']:.6f}", f"{losses['cliff']:.6f}", f"{losses['stab']:.6f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
         ])
         metrics_f.flush()

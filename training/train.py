@@ -27,7 +27,7 @@ def _collate(batch, device, aux_ease=False):
     Examples are (planes, policy, value) or, with aux_ease,
     (planes, policy, value, ease_target, ease_mask).
     """
-    planes = np.stack([b[0] for b in batch])               # (B,18,8,8)
+    planes = np.stack([b[0] for b in batch])               # (B,17,8,8)
     policy = np.stack([b[1] for b in batch])               # (B,NUM_ACTIONS)
     value  = np.array([b[2] for b in batch], np.float32)   # (B,)
 
@@ -51,12 +51,19 @@ def _masked_mse(pred, target, mask):
 
 
 def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
-                aux_ease=False, ease_weight=1.0):
+                aux_ease=False, ease_weight=1.0, scaler=None):
     """
     Run gradient steps. Returns mean losses {total, policy, value, ease}.
     With aux_ease=False this is the original policy+value training (ease stays 0).
+
+    `scaler` is the AMP GradScaler and MUST persist across iterations: its scale
+    factor is tuned online (halved on overflow, periodically raised), so building
+    a new one every call discards that calibration and re-runs the warmup each
+    time. Create one GradScaler once in the training loop and pass it in; the
+    fallback below only exists for standalone/one-off use.
     """
-    scaler = GradScaler("cuda")
+    if scaler is None:
+        scaler = GradScaler("cuda")
 
     net.train()
     acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0)

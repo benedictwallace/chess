@@ -97,6 +97,18 @@ class Chess:
             return -1.0 if side == "white" else 1.0
         return 0.0   # stalemate, threefold, or fifty-move
 
+    def material_diff(self) -> int:
+        """
+        Net material from white's POV (white total minus black total) using the
+        adjudication piece values. +5 means 'white is up a rook'; negative means
+        black leads. Cheap: a popcount per piece bitboard, no move generation.
+        """
+        white = sum(_ADJ_VALUES[p] * bin(self.board.bb["white", p]).count("1")
+                    for p in _ADJ_VALUES)
+        black = sum(_ADJ_VALUES[p] * bin(self.board.bb["black", p]).count("1")
+                    for p in _ADJ_VALUES)
+        return white - black
+
     def adjudicate(self, margin: float = 5.0) -> float:
         """
         Score an unfinished (ply-cap) position by material, from white's POV:
@@ -105,11 +117,7 @@ class Chess:
         hard ply cap, so reaching a won position still earns a win signal even
         if the engine cannot deliver mate in time.
         """
-        white = sum(_ADJ_VALUES[p] * bin(self.board.bb["white", p]).count("1")
-                    for p in _ADJ_VALUES)
-        black = sum(_ADJ_VALUES[p] * bin(self.board.bb["black", p]).count("1")
-                    for p in _ADJ_VALUES)
-        diff = white - black
+        diff = self.material_diff()
         if diff >= margin:
             return 1.0
         if diff <= -margin:

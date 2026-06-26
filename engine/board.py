@@ -154,6 +154,22 @@ class Board:
         self.enPassantSq = -1
         self.sideToMove = "white"
         self.history = []   # undo stack for make/unmake
+        # square -> (colour, piece) key (or None). Maintained incrementally in
+        # make/unmake so pieceAt() is O(1) instead of a 12-bitboard scan.
+        self._build_mailbox()
+
+    def _build_mailbox(self):
+        """(Re)build the square->piece mailbox from the bitboards. Used at
+        construction and by updatePieces(); the hot path keeps it in sync
+        incrementally and never calls this."""
+        mb = [None] * 64
+        for key, bb in self.bb.items():
+            x = bb
+            while x:
+                sq = (x & -x).bit_length() - 1
+                mb[sq] = key
+                x &= x - 1
+        self.mailbox = mb
 
     def stateKey(self) -> tuple:
         return (
@@ -188,6 +204,7 @@ class Board:
         new.enPassantSq = self.enPassantSq
         new.sideToMove = self.sideToMove
         new.history = []   # fresh undo stack; clones don't share history
+        new.mailbox = list(self.mailbox)   # shallow copy of the square->piece map
         return new
 
     def getWhitePieces(self) -> int:
@@ -230,6 +247,9 @@ class Board:
         self.whitePieces = self.getWhitePieces()
         self.blackPieces = self.getBlackPieces()
         self.allPieces = self.whitePieces | self.blackPieces
+        # rebuild the mailbox to match (used by the FEN loader, which sets bb
+        # directly via __new__ and then calls this).
+        self._build_mailbox()
 
     def getAttackedSq(self, colour: str) -> int:
         """
@@ -363,20 +383,16 @@ class Board:
             self.unmakeMove(move)
         return legal
 
-    def pieceAt(self, square: Move) -> tuple[str]:
-        bit = 1 << square
-
-        for key, bb in self.bb.items():
-            if bit & bb:
-                return key
-        return None
+    def pieceAt(self, square: int) -> tuple[str]:
+        # O(1) mailbox lookup (kept in sync by make/unmake).
+        return self.mailbox[square]
     
     def makeMove(self, move):
         fromBB = 1 << move.fromSq
         toBB = 1 << move.toSq
 
-        # find which piece is moving
-        mover = self.pieceAt(move.fromSq)
+        # find which piece is moving (O(1) mailbox read)
+        mover = self.mailbox[move.fromSq]
         if mover is None:
             raise ValueError(f"makeMove: no piece on fromSq={move.fromSq}")
         
@@ -384,7 +400,7 @@ class Board:
         oppColour = "black" if colour == "white" else "white"
         
         # find if move takes
-        taken = self.pieceAt(move.toSq)
+        taken = self.mailbox[move.toSq]
 
         # save everything unmake can't recompute, BEFORE we mutate anything
         self.history.append((
@@ -393,9 +409,11 @@ class Board:
             self.blackKCastle, self.blackQCastle,
         ))
 
-        # move mover
+        # move mover (bitboards + mailbox)
         self.bb[mover] &= ~fromBB
         self.bb[mover] |= toBB
+        self.mailbox[move.fromSq] = None
+        self.mailbox[move.toSq] = mover      # overwrites `taken` if a capture
 
         # take piece
         if taken is not None:
@@ -407,26 +425,32 @@ class Board:
             promoted = promoMap[move.promotion]
             self.bb[colour, "pawn"] &= ~toBB # remove the pawn
             self.bb[colour, promoted] |= toBB # add the promoted piece
+            self.mailbox[move.toSq] = (colour, promoted)
 
         # castling
         if move.castle:
             if move.toSq == 6: # white kingside
                 self.bb[colour, "rook"] &= ~(1 << 7)
                 self.bb[colour, "rook"] |= (1 << 5)
+                self.mailbox[7] = None; self.mailbox[5] = (colour, "rook")
             elif move.toSq == 2: # white queenside
                 self.bb[colour, "rook"] &= ~(1 << 0)
                 self.bb[colour, "rook"] |= (1 << 3)
+                self.mailbox[0] = None; self.mailbox[3] = (colour, "rook")
             elif move.toSq == 62: # black kingside
                 self.bb[colour, "rook"] &= ~(1 << 63)
                 self.bb[colour, "rook"] |= (1 << 61)
+                self.mailbox[63] = None; self.mailbox[61] = (colour, "rook")
             elif move.toSq == 58: # black queenside
                 self.bb[colour, "rook"] &= ~(1 << 56)
                 self.bb[colour, "rook"] |= (1 << 59)
+                self.mailbox[56] = None; self.mailbox[59] = (colour, "rook")
 
         # enpassant
         if move.enPassant:
             capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
             self.bb[oppColour, "pawn"] &= ~(1 << capturedSq)
+            self.mailbox[capturedSq] = None
 
         # update enpensantsq + castling rights
         if piece == "pawn" and abs(move.toSq - move.fromSq) == 16:
@@ -497,20 +521,29 @@ class Board:
             self.bb[mover] &= ~toBB
             self.bb[mover] |= fromBB
 
+        # mailbox: piece returns to fromSq, destination restored to whatever was
+        # captured (None if the move wasn't a capture).
+        self.mailbox[move.fromSq] = mover
+        self.mailbox[move.toSq] = taken
+
         # undo the castling rook hop
         if move.castle:
             if move.toSq == 6:        # white kingside: rook 7->5, put it back
                 self.bb[colour, "rook"] &= ~(1 << 5)
                 self.bb[colour, "rook"] |= (1 << 7)
+                self.mailbox[5] = None; self.mailbox[7] = (colour, "rook")
             elif move.toSq == 2:      # white queenside: rook 0->3
                 self.bb[colour, "rook"] &= ~(1 << 3)
                 self.bb[colour, "rook"] |= (1 << 0)
+                self.mailbox[3] = None; self.mailbox[0] = (colour, "rook")
             elif move.toSq == 62:     # black kingside: rook 63->61
                 self.bb[colour, "rook"] &= ~(1 << 61)
                 self.bb[colour, "rook"] |= (1 << 63)
+                self.mailbox[61] = None; self.mailbox[63] = (colour, "rook")
             elif move.toSq == 58:     # black queenside: rook 56->59
                 self.bb[colour, "rook"] &= ~(1 << 59)
                 self.bb[colour, "rook"] |= (1 << 56)
+                self.mailbox[59] = None; self.mailbox[56] = (colour, "rook")
 
         # restore a normally-captured piece on toSq
         if taken is not None:
@@ -520,6 +553,7 @@ class Board:
         if move.enPassant:
             capturedSq = move.toSq - 8 if colour == "white" else move.toSq + 8
             self.bb[oppColour, "pawn"] |= (1 << capturedSq)
+            self.mailbox[capturedSq] = (oppColour, "pawn")
 
         # restore scalar state and side to move
         self.enPassantSq = prevEP
@@ -582,5 +616,3 @@ if __name__ == "__main__":
     print(perft(b, "white", 2))
     print(perft(b, "white", 3))
     print(perft(b, "white", 4))
-
-    #print(Board().stateKey() == Board().stateKey())
