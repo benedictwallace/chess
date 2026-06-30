@@ -5,6 +5,7 @@ from engine.bitboard import (
     mustBeEmptyKwhite, mustBeEmptyQwhite,
     mustBeEmptyKblack, mustBeEmptyQblack,
 )
+from engine.bitboard import msb
 from engine.moves import (
     Move,
     knightMoves, getKnightMoves,
@@ -13,6 +14,7 @@ from engine.moves import (
     queenMoves, getQueenMoves,
     kingMoves, getKingMoves,
     pawnMoves, getPawnMoves, pawnAttacks,
+    RAYS, _RAY_POS, _ROOK_DIR_IDX, _BISHOP_DIR_IDX,
 )
 
 
@@ -368,19 +370,83 @@ class Board:
         kingSq = lsb(self.bb[colour, "king"])
         return self.squareAttackedBy(kingSq, oppColour)
 
+    def _pinnedBB(self, kingSq: int, colour: str) -> int:
+        """
+        Bitboard of our pieces that are ABSOLUTELY PINNED to our king (a single
+        own piece sitting between the king and an enemy slider of the matching
+        type). Found with 8 ray casts from the king using the precomputed RAYS:
+        down each ray, the first piece must be ours and the next must be an enemy
+        rook/queen (orthogonal) or bishop/queen (diagonal). Moving a pinned piece
+        can expose the king, so those moves still get a make/unmake check; every
+        other non-king, non-en-passant move (out of check) is legal for free.
+        """
+        occ = self.allPieces
+        own = self.whitePieces if colour == "white" else self.blackPieces
+        opp = "black" if colour == "white" else "white"
+        enemyRQ = self.bb[opp, "rook"] | self.bb[opp, "queen"]
+        enemyBQ = self.bb[opp, "bishop"] | self.bb[opp, "queen"]
+        rays = RAYS[kingSq]
+        pinned = 0
+
+        for d in _ROOK_DIR_IDX:
+            blockers = rays[d] & occ
+            if not blockers:
+                continue
+            first = lsb(blockers) if _RAY_POS[d] else msb(blockers)
+            if not ((own >> first) & 1):
+                continue
+            rest = RAYS[first][d] & occ
+            if not rest:
+                continue
+            second = lsb(rest) if _RAY_POS[d] else msb(rest)
+            if (enemyRQ >> second) & 1:
+                pinned |= (1 << first)
+
+        for d in _BISHOP_DIR_IDX:
+            blockers = rays[d] & occ
+            if not blockers:
+                continue
+            first = lsb(blockers) if _RAY_POS[d] else msb(blockers)
+            if not ((own >> first) & 1):
+                continue
+            rest = RAYS[first][d] & occ
+            if not rest:
+                continue
+            second = lsb(rest) if _RAY_POS[d] else msb(rest)
+            if (enemyBQ >> second) & 1:
+                pinned |= (1 << first)
+
+        return pinned
+
     def legalMoves(self, colour: str) -> list[Move]:
         """
         Return moves that don't leave our own king in check.
 
+        A pseudo-legal move can only be illegal if it exposes our king, which
+        happens ONLY for: a king move, a move of an absolutely-pinned piece, an
+        en-passant capture (it vacates two squares on one rank), or any move
+        while we are already in check. We detect check (one squareAttackedBy)
+        and pins (cheap ray casts) ONCE per position, then make/unmake-verify
+        only those few moves; all other moves are legal immediately. This avoids
+        the make/unmake + full attack scan that the old version ran on EVERY
+        pseudo-move (the dominant self-play cost). The legal set is identical --
+        verified by perft.
         """
         oppColour = "black" if colour == "white" else "white"
+        kingSq = lsb(self.bb[colour, "king"])
+        inCheck = self.squareAttackedBy(kingSq, oppColour)
+        pinned = self._pinnedBB(kingSq, colour)
+
         legal = []
         for move in self.getMoves(colour):
-            self.makeMove(move)
-            kingSq = lsb(self.bb[colour, "king"])
-            if not self.squareAttackedBy(kingSq, oppColour):
+            frm = move.fromSq
+            if inCheck or frm == kingSq or ((pinned >> frm) & 1) or move.enPassant:
+                self.makeMove(move)
+                if not self.squareAttackedBy(lsb(self.bb[colour, "king"]), oppColour):
+                    legal.append(move)
+                self.unmakeMove(move)
+            else:
                 legal.append(move)
-            self.unmakeMove(move)
         return legal
 
     def pieceAt(self, square: int) -> tuple[str]:

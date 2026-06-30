@@ -23,6 +23,12 @@ UNDERPROMO_DIRS = [0, -1, 1]
 
 NUM_ACTIONS = 64 * 73 # 64 From squares, 73 move types
 
+# precomputed reverse lookups (replace per-call list.index()/`in` scans)
+_DIR_TO_IDX = {d: i for i, d in enumerate(DIRECTIONS)}
+_KNIGHT_TO_IDX = {m: i for i, m in enumerate(KNIGHT_MOVES)}
+_UNDERPROMO_PIECE_IDX = {p: i for i, p in enumerate(UNDERPROMO_PIECES)}
+_UNDERPROMO_DIR_IDX = {d: i for i, d in enumerate(UNDERPROMO_DIRS)}
+
 def _rc(square):
     """
     Returns row, column
@@ -72,32 +78,35 @@ def encodeMovePOV(move: Move, sideToMove: str) -> int:
     moves with no collisions -- see the tests.
     """
     if sideToMove == "black":
-        move = flip_move_vertical(move)
-    return encodeMove(move)
+        # flip the squares directly rather than building a flipped Move object
+        return _encode_raw(_flip_sq_vertical(move.fromSq),
+                           _flip_sq_vertical(move.toSq), move.promotion)
+    return _encode_raw(move.fromSq, move.toSq, move.promotion)
 
 
 def encodeMove(move: Move) -> int:
-    fromR, fromC = _rc(move.fromSq)
-    toR, toC = _rc(move.toSq)
+    return _encode_raw(move.fromSq, move.toSq, move.promotion)
+
+
+def _encode_raw(fromSq: int, toSq: int, promotion) -> int:
+    fromR, fromC = fromSq >> 3, fromSq & 7
+    toR, toC = toSq >> 3, toSq & 7
     dR, dC = toR - fromR, toC - fromC
 
     # under promo
-    if move.promotion is not None and move.promotion != "Q":
-        pieceIdx = UNDERPROMO_PIECES.index(move.promotion)
-        dirIdx = UNDERPROMO_DIRS.index(dC)
-        moveType = 56 + 8 + pieceIdx * 3 + dirIdx
-        return move.fromSq * 73 + moveType
+    if promotion is not None and promotion != "Q":
+        moveType = 64 + _UNDERPROMO_PIECE_IDX[promotion] * 3 + _UNDERPROMO_DIR_IDX[dC]
+        return fromSq * 73 + moveType
     # knight moves
-    if (dR, dC) in KNIGHT_MOVES:
-        moveType = 56 + KNIGHT_MOVES.index((dR, dC))
-        return move.fromSq * 73 + moveType
+    ki = _KNIGHT_TO_IDX.get((dR, dC))
+    if ki is not None:
+        return fromSq * 73 + 56 + ki
     # all other moves
     stepR = (dR > 0) - (dR < 0)
     stepC = (dC > 0) - (dC < 0)
-    distance = max(abs(dR), abs(dC))
-    dirIdx = DIRECTIONS.index((stepR, stepC))
-    moveType = dirIdx * 7 + (distance - 1)
-    return move.fromSq * 73 + moveType
+    distance = abs(dR) if abs(dR) > abs(dC) else abs(dC)
+    dirIdx = _DIR_TO_IDX[(stepR, stepC)]
+    return fromSq * 73 + dirIdx * 7 + (distance - 1)
 
 
 

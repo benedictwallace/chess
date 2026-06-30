@@ -232,7 +232,17 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             env = g.env.clone()
             path = [node]
             while node.expanded and not node.terminal and node.children:
-                node = max(node.children, key=lambda ch: _puct_score(ch, node, c))
+                sqrt_pv = math.sqrt(node.visits)
+                best = None
+                best_score = -1e30
+                for ch in node.children:
+                    v = ch.visits
+                    q = ch.value / v if v else 0.0
+                    s = q + c * ch.prior * sqrt_pv / (1 + v)
+                    if s > best_score:
+                        best_score = s
+                        best = ch
+                node = best
                 env.step(node.move)
                 path.append(node)
 

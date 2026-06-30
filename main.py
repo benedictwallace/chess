@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import math
 import numpy as np
 import torch
 from torch.amp import GradScaler
@@ -14,16 +15,16 @@ torch.backends.cudnn.benchmark = True
 
 CONFIG = dict(
     # network
-    channels=128,
-    num_blocks=8,
+    channels=192,
+    num_blocks=10,
 
     # outer loop
-    loop_iterations=200,        # self-play/train cycles
+    loop_iterations=500,        # self-play/train cycles
 
     # self-play
-    games_per_iter=24,
-    search_iterations=400,     # PUCT iterations per move
-    max_plies=200,             # hard ply cap. With early adjudication enabled,
+    games_per_iter=128,
+    search_iterations=600,     # PUCT iterations per move
+    max_plies=100,             # hard ply cap. With early adjudication enabled,
                                # decided games stop well before this, so the cap
                                # mainly bounds long *balanced* games -- raising it
                                # just spends more self-play time there. Raise only
@@ -55,16 +56,29 @@ CONFIG = dict(
 
     # training
     buffer_capacity=200_000,
-    train_batches=32,
+    train_batches=100,
     batch_size=256,
     lr=1e-3,
+    lr_min=1e-4,                # cosine-decay floor; LR goes lr -> lr_min over the run
     weight_decay=1e-4,
 
     # io
     checkpoint_dir="checkpoints",
     checkpoint_every=5,
     metrics_file="metrics.csv",
+    resume=True,                # auto-load latest.pt at startup if present
 )
+
+
+def cosine_lr(it, base_lr, lr_min, total):
+    """Cosine-decayed learning rate: base_lr at it==1 down to lr_min at it==total.
+    A pure function of the iteration number, so it is exactly correct across
+    resumes -- there is no scheduler state to save or restore, and resuming from a
+    checkpoint that predates the schedule still lands on the right LR for `it`.
+    `total` should be the full planned run length (loop_iterations)."""
+    span = max(1, total - 1)
+    t = min(max(it - 1, 0), span) / span
+    return lr_min + 0.5 * (base_lr - lr_min) * (1.0 + math.cos(math.pi * t))
 
 
 def main(cfg=CONFIG):
@@ -99,6 +113,36 @@ def main(cfg=CONFIG):
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
+    # ---- resume from the last checkpoint so re-launching never loses progress ----
+    # Without this, every run starts from a fresh random net. We auto-load
+    # latest.pt if it exists (disable with cfg["resume"]=False to force a fresh
+    # run -- or just move/delete latest.pt). The buffer is NOT persisted (it would
+    # be multi-GB); it refills from self-play within a few iterations.
+    start_it = 1
+    latest_path = os.path.join(cfg["checkpoint_dir"], "latest.pt")
+    if cfg.get("resume", True) and os.path.exists(latest_path):
+        ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        # weights were saved from the UNWRAPPED module (no "_orig_mod." prefix),
+        # so load them back into the unwrapped module under torch.compile.
+        target = getattr(net, "_orig_mod", net)
+        target.load_state_dict(ckpt["model_state"])
+        if "optim_state" in ckpt:
+            optimiser.load_state_dict(ckpt["optim_state"])
+        start_it = ckpt.get("iteration", 0) + 1
+        print(f"resumed from {latest_path} at iteration {ckpt.get('iteration')}, "
+              f"continuing at {start_it}")
+        saved = ckpt.get("config", {})
+        if saved.get("channels") != cfg["channels"] or saved.get("num_blocks") != cfg["num_blocks"]:
+            print("  WARNING: checkpoint network size differs from current config; "
+                  "a fresh run is needed if load failed above.")
+    else:
+        print("starting a fresh run (no checkpoint to resume)")
+
+    if start_it > cfg["loop_iterations"]:
+        print(f"already completed {start_it-1} iterations >= loop_iterations="
+              f"{cfg['loop_iterations']}; nothing to do. Raise loop_iterations to train more.")
+        return
+
     # ---- metrics log: write a header once, then append a row per iteration ----
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
     new_log = not os.path.exists(metrics_path)
@@ -112,9 +156,15 @@ def main(cfg=CONFIG):
         ])
         metrics_f.flush()
 
-    for it in range(1, cfg["loop_iterations"] + 1):
+    for it in range(start_it, cfg["loop_iterations"] + 1):
         n_iters = cfg["loop_iterations"]
         print(f"\n ===== Loop iteration {it}/{n_iters} =====")
+
+        # cosine-decay the learning rate (lr -> lr_min over the planned run)
+        lr = cosine_lr(it, cfg["lr"], cfg["lr_min"], cfg["loop_iterations"])
+        for grp in optimiser.param_groups:
+            grp["lr"] = lr
+        print(f"  lr {lr:.2e}")
 
         print("self play")
         t0 = time.time()
