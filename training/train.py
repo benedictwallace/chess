@@ -63,7 +63,8 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
     fallback below only exists for standalone/one-off use.
     """
     if scaler is None:
-        scaler = GradScaler("cuda")
+        scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    use_amp = (device.type == "cuda")
 
     net.train()
     acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0)
@@ -82,7 +83,7 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
 
         optimiser.zero_grad()
 
-        with autocast(device_type="cuda"):
+        with autocast(device_type=device.type, enabled=use_amp):
             out = net(planes)
             policy_logits, value_p = out[0], out[1]
 

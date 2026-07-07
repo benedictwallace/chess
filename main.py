@@ -19,17 +19,37 @@ CONFIG = dict(
     num_blocks=10,
 
     # outer loop
-    loop_iterations=500,        # self-play/train cycles
+    loop_iterations=800,        # self-play/train cycles
 
     # self-play
-    games_per_iter=128,
-    search_iterations=600,     # PUCT iterations per move
-    max_plies=100,             # hard ply cap. With early adjudication enabled,
-                               # decided games stop well before this, so the cap
-                               # mainly bounds long *balanced* games -- raising it
-                               # just spends more self-play time there. Raise only
-                               # if you observe decided games being cut at the cap.
+    games_per_iter=192,
+    search_iterations=700,     # PUCT iterations per move
+    max_plies=300,             # hard ply cap. WAS 100 -- far too low: 100 plies
+                               # is 50 moves, so every game not won by the
+                               # adjudication margin within 50 moves was
+                               # labelled a DRAW. That defines endgame
+                               # conversion, mating technique, and sub-rook
+                               # advantages as unwinnable -- the value head
+                               # learns "small edge = draw" and strength caps.
+                               # With early adjudication on, decided games
+                               # still stop well before this, so 300 mainly
+                               # lets balanced games resolve properly (and
+                               # yields more recorded plies per game, which
+                               # also helps the data-starved async learner).
     temp_moves=20,
+
+    # self-play throughput (see training/self_play_batched.py):
+    #  * subtree reuse: after a move, carry the chosen child's already-searched
+    #    tree over as the next root instead of rebuilding it. On by default;
+    #    ~15-20% fewer simulations, no change to what gets recorded.
+    #  * playout-cap randomization: run the full `search_iterations` budget on only
+    #    `full_search_prob` of moves (ONLY these are recorded as training targets)
+    #    and a cheap `fast_search_iterations` budget on the rest. ~2.5-3x less
+    #    self-play compute per game. Tune the fraction/budget and watch strength;
+    #    set full_search_prob=1.0 to disable (i.e. train on every move as before).
+    reuse_tree=True,
+    full_search_prob=0.25,
+    fast_search_iterations=100,
 
     # batched self-play. Games are played in one process and their MCTS leaf
     # evaluations are batched together into a single GPU forward pass. `concurrency`
@@ -51,6 +71,11 @@ CONFIG = dict(
     # for that side. Gives clearly-won games a clean +/-1 value target (instead of
     # a noisy ply-cap snapshot) and removes the biggest self-play cost: grinding
     # out already-won games. Set adj_plies=0 to disable.
+    #
+    # NOTE on the ply cap itself: games that still hit max_plies while materially
+    # BALANCED are no longer labelled a hard 0.0 draw -- self_play_batched now
+    # bootstraps their value target from the last full-search root value. See
+    # finalize() in training/self_play_batched.py.
     adj_margin=5.0,            # 5 == 'up a rook'
     adj_plies=20,              # consecutive plies the lead must hold
 
@@ -64,7 +89,7 @@ CONFIG = dict(
 
     # io
     checkpoint_dir="checkpoints",
-    checkpoint_every=5,
+    checkpoint_every=10,
     metrics_file="metrics.csv",
     resume=True,                # auto-load latest.pt at startup if present
 )
@@ -109,7 +134,7 @@ def main(cfg=CONFIG):
     # One persistent AMP loss scaler for the whole run. Recreating it each
     # iteration would reset the online loss-scale calibration and re-run its
     # warmup every time (occasionally skipping steps); see train_epoch.
-    scaler = GradScaler("cuda")
+    scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
@@ -178,6 +203,9 @@ def main(cfg=CONFIG):
             adj_plies=cfg["adj_plies"],
             use_cache=cfg["use_cache"],
             cache_cap=cfg["cache_cap"],
+            reuse_tree=cfg["reuse_tree"],
+            full_search_prob=cfg["full_search_prob"],
+            fast_iterations=cfg["fast_search_iterations"],
         )
         selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
