@@ -19,52 +19,72 @@ Within a single game this is, with the default settings, identical in semantics
 to search.puct.search: one pending leaf per tree per round (so no virtual loss is
 needeed), `iterations` simulations per move, Dirichlet noise at the root, the same
 PUCT formula, the same value-sign / backprop convention, and the same
-early-adjudication and ply-cap handling as training.self_play.play_game. Examples
-are the same (planes, policy_target, value_target) 3-tuples.
+early-adjudication and ply-cap handling as training.self_play.play_game.
 
-FORCED ROOT VISITS (Gumbel/KataGo-style, new): on full-search moves, the top
-`root_force_m` root children BY PRIOR are each guaranteed at least a floor of
-visits before ordinary PUCT selection resumes. Plain PUCT starves everything
-but its favorite: the runner-up typically ends a 700-sim search with a few
-dozen noisy backups and the rest of the tail with 0-10, which makes root Q
-values unusable for anything that compares actions -- action gaps, advantage
-variance, ease/forgiveness statistics -- and leaves the policy target's tail
-uninformative. The floor gives the top-m actions Q estimates with matched
-standard errors at a bounded cost (m * floor simulations; 8 * 40 = 320 of a
-700 budget by default). The floor auto-shrinks to move_cap // (2*m) when the
-budget is small, and fast (playout-capped) moves are never forced. Because
-forced visits inflate the visit counts of moves PUCT would not have chosen,
-they are SUBTRACTED from every non-best child when building the policy target
-and when sampling the move to play (KataGo's policy-target pruning) -- so
-training targets keep the sharpness of plain PUCT while the tree retains the
-balanced Q statistics. Set root_force_m=0 to disable.
+EXAMPLES (changed): each recorded row is now a 5-tuple
+    (planes, policy_target, value_target, ease_target, ease_mask)
+matching training.train's aux_ease path. ease_target is a search-derived
+forgiveness statistic of the ROOT position in [0, 1] (see below); ease_mask is
+1.0 where the statistic was computable and 0.0 otherwise (masked rows still
+train policy/value, contribute nothing to the ease loss).
 
-VALUE LABELS FOR PLY-CAP GAMES (changed): a game that hits `max_plies` without
-a terminal result is scored, as before, by material adjudication first -- a
-lead of >= adj_margin is a win for that side. But a game that is materially
-BALANCED at the cap is no longer labelled a hard 0.0 draw. Labelling every
-unresolved game a draw taught the value head that any advantage smaller than
-the margin (and any win needing more than max_plies) is worth nothing, which
-suppresses endgame conversion entirely. Instead, the value target for a
-balanced cap game is bootstrapped from the LAST recorded full-search root
-value (white POV, continuous in [-1, 1]) -- the search's own estimate of how
-the unresolved game stands. MSE handles continuous targets fine; policy
-targets are unaffected. Falls back to 0.0 if the game recorded no full-search
-move. True terminal draws (stalemate, threefold, fifty-move) are still 0.0.
+EASE TARGETS (new): the ease head amortises a search statistic, so every
+recorded root computes one. Definition is configurable via ease_target_mode
+("gap" or "entropy" -- the two local forgiveness statistics of search/ease.py
+-- or a recursive aggregate of either):
+  * "gap"  (default): F = exp(-(Q1 - Q2) / ease_tau) over the root children
+    that met the forced-visit floor -- the local action-gap forgiveness.
+  * "tree": the recursive formulation F(s) = (1-g) F_local + g * sum
+    N(a)/sum N * F(s_a) over the search tree (ease_gamma).
+  * "flat": the subtree formulation, F_local of every subtree node weighted by
+    its visit share.
+Set ease_tau from a probe_ease.py calibration of a comparable checkpoint.
+All ease statistics are imported from search/ease.py -- the SAME functions the
+probe and the play GUI use, so head targets and displayed/probed values can
+never drift apart.
+
+MORE EXHAUSTIVE ROOT SEARCH FOR EASE (new): trustworthy ease targets need more
+balanced root Qs than move selection does, so on full-search moves the budget
+is extended by `ease_extra_sims` and the forced-visit floor is WIDENED to
+`ease_force_m` children (if larger than root_force_m). With the defaults, full
+moves run 700+300 = 1000 sims with the top 12 prior moves floored -- Q1..Q12
+all carry matched standard errors. Because forced visits are PRUNED from the
+recorded policy target (see below), the wider floor sharpens the ease target
+WITHOUT blurring the policy target. Cost: full moves are `full_search_prob` of
+plies, so +300 sims on them is roughly +30% self-play compute at the default
+0.25. With ease_targets=False, rows are still 5-tuples but carry ease_mask=0.0
+everywhere, so the training path never needs to branch on format.
+
+FORCED ROOT VISITS (Gumbel/KataGo-style): on full-search moves, the top
+`root_force_m` (or `ease_force_m`, whichever is larger when ease targets are
+on) root children BY PRIOR are each guaranteed a floor of visits before
+ordinary PUCT selection resumes. Plain PUCT starves everything but its
+favourite, which makes root Q values unusable for anything that compares
+actions. The floor auto-shrinks to move_cap // (2*m) when the budget is small,
+and fast (playout-capped) moves are never forced. Forced visits are SUBTRACTED
+from every non-best child when building the policy target and when sampling
+the move to play (KataGo's policy-target pruning), so training targets keep
+the sharpness of plain PUCT while the tree retains balanced Q statistics.
+Set root_force_m=0 AND ease_targets=False to restore plain PUCT roots.
+
+VALUE LABELS FOR PLY-CAP GAMES: a game that hits `max_plies` without a
+terminal result is scored by material adjudication first -- a lead of
+>= adj_margin is a win for that side. A game that is materially BALANCED at
+the cap is NOT labelled a hard 0.0 draw (that taught the value head that any
+advantage smaller than the margin, and any win needing more than max_plies,
+is worthless); its value target is bootstrapped from the LAST recorded
+full-search root value (white POV, continuous in [-1, 1]). True terminal
+draws (stalemate, threefold, fifty-move) are still 0.0.
 
 Two optional throughput features cut the number of network evaluations (the
-dominant cost) -- see run_selfplay for the full description:
-  * subtree reuse (reuse_tree, on by default): carry the chosen child's already
-    searched subtree over as the next root instead of rebuilding it;
-  * playout-cap randomization (full_search_prob<1 + fast_iterations): search most
-    moves cheaply and only a fraction at full budget, recording only the
-    full-budget moves as training rows.
+dominant cost) -- see run_selfplay:
+  * subtree reuse (reuse_tree, on by default);
+  * playout-cap randomization (full_search_prob<1 + fast_iterations), the
+    KataGo trick: only full-budget moves are recorded as training rows.
 
 A small within-phase evaluation cache (keyed by the exact position) skips the
-network for transpositions and repetitions. It stores the legal-move priors and
-value, NOT raw logits, so each entry is a few KB. It is rebuilt every call
-because the network changes between training iterations -- caching across
-iterations would serve stale outputs.
+network for transpositions and repetitions. It is rebuilt every call because
+the network changes between training iterations.
 """
 
 import math
@@ -73,6 +93,7 @@ import numpy as np
 from engine.gameEnv import Chess
 from model.encoding import encode
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
+from search.ease import ease_target
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +192,7 @@ class _GameState:
     __slots__ = ("env", "root", "ply", "adj_streak", "early_result",
                  "sims_done", "done", "history",
                  "move_cap", "is_full_move", "chosen",
-                 "force_n", "forced_set", "forced_counts")
+                 "force_m", "force_n", "forced_set", "forced_counts")
 
     def __init__(self):
         self.env = Chess()
@@ -183,10 +204,11 @@ class _GameState:
         self.early_result = None
         self.sims_done = 0
         self.done = False
-        self.history = []   # (planes, policy_target, mover_sign, v_white)
+        self.history = []   # (planes, policy_t, mover_sign, v_white, ease_t, ease_m)
         self.move_cap = 0         # per-move simulation budget (set by _begin_move)
         self.is_full_move = True  # full-search move? only these become training rows
         self.chosen = None        # child node do_move picked (for subtree reuse)
+        self.force_m = 0          # per-move width of the forced set
         self.force_n = 0          # per-move forced-visit floor (0 = no forcing)
         self.forced_set = None    # top-m root children by prior (computed lazily
                                   # after root expansion, i.e. post-noise)
@@ -203,6 +225,8 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  use_cache=True, cache_cap=200_000,
                  reuse_tree=True, full_search_prob=1.0, fast_iterations=None,
                  root_force_m=8, root_force_visits=40,
+                 ease_targets=True, ease_tau=0.05, ease_target_mode="gap",
+                 ease_gamma=0.85, ease_extra_sims=300, ease_force_m=12,
                  verbose=True):
     """
     Play `num_games` games, keeping up to `concurrency` of them running at once
@@ -213,44 +237,40 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         logits      : array-like [B, NUM_ACTIONS]   (mover-POV policy logits)
         values      : array-like [B]                (mover-POV value in [-1,1])
 
-    Returns a flat list of (planes, policy_target, value_target) examples.
+    Returns a flat list of (planes, policy_target, value_target, ease_target,
+    ease_mask) examples -- the aux_ease format of training.train.
 
-    Two throughput options (both reduce the number of network evaluations, which
-    is the dominant self-play cost):
+    Throughput options: reuse_tree (carry the chosen child's searched subtree
+    over as the next root; sound because the net is fixed for the whole call)
+    and playout-cap randomization (full_search_prob < 1 with fast_iterations:
+    only full-budget moves are recorded and get root noise).
 
-    * reuse_tree: after a move is played, keep the subtree under the chosen child
-      as the next root instead of rebuilding from scratch. The chosen move is the
-      most-visited child, so its subtree already holds a large share of this
-      move's simulations; the next search only needs to top the budget back up.
-      Sound here because the network is fixed for the whole call, so carried
-      statistics are valid. sims_done starts at the reused root's visit count.
+    Forced root visits: on full-search moves, each of the top
+    max(root_force_m, ease_force_m if ease_targets else 0) root children by
+    prior is selected directly (bypassing PUCT) until it has
+    min(root_force_visits, move_cap // (2*m)) visits. Equalises the top
+    actions' Q standard errors (prerequisite for gap/variance/ease statistics
+    and clean policy tails). Forced visits are pruned from non-best moves in
+    the recorded policy target and the move-selection distribution, so targets
+    keep PUCT's sharpness. Visits carried in by subtree reuse count toward the
+    floor.
 
-    * playout-cap randomization (full_search_prob < 1 with fast_iterations set):
-      run the full `iterations` budget on only a fraction of moves and a small
-      `fast_iterations` budget on the rest. ONLY full-search moves are emitted as
-      training rows and get root Dirichlet noise; fast moves still advance the
-      game (and, with reuse, often need almost no new simulations). This is the
-      KataGo trick and roughly halves self-play cost for similar strength.
-
-    Forced root visits (root_force_m, root_force_visits): on full-search moves,
-    each of the top `root_force_m` root children by prior is selected directly
-    (bypassing PUCT) until it has at least `min(root_force_visits,
-    move_cap // (2*root_force_m))` visits. This equalizes the standard error of
-    the top actions' Q values, which plain PUCT starves -- the prerequisite for
-    trustworthy action gaps / advantage-variance / ease statistics at the root,
-    and cleaner policy-target tails. Forced visits are pruned from non-best
-    moves in the recorded policy target and the move-selection distribution
-    (KataGo-style), so targets keep PUCT's sharpness. root_force_m=0 disables.
-    Visits carried in by subtree reuse count toward the floor (already-met
-    floors trigger no extra forcing).
+    Ease targets: on full-search moves the budget is iterations +
+    ease_extra_sims and after the search an ease statistic of the root
+    (ease_target_mode: "gap" | "entropy" | "tree" | "flat"; temperature
+    ease_tau; "tree" decay ease_gamma) is recorded with mask 1.0. Rows where the statistic is
+    uncomputable, or all rows when ease_targets=False, carry mask 0.0 -- the
+    ease loss ignores them, policy/value train as normal.
     """
     concurrency = max(1, min(concurrency, num_games))
     cache = {} if use_cache else None
 
-    full_cap = iterations
-    fast_cap = full_cap if fast_iterations is None else max(1, int(fast_iterations))
+    full_cap = iterations + (int(ease_extra_sims) if ease_targets else 0)
+    fast_cap = iterations if fast_iterations is None else max(1, int(fast_iterations))
     full_search_prob = min(1.0, max(0.0, full_search_prob))
     root_force_m = max(0, int(root_force_m))
+    full_force_m = max(root_force_m, int(ease_force_m)) if ease_targets \
+        else root_force_m
     move_rng = np.random.default_rng()
 
     active = [_GameState() for _ in range(concurrency)]
@@ -268,19 +288,17 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 rwp = r                       # true terminal: win/loss/draw as-is
             else:
                 # Ply-cap hit without a terminal result. Material adjudication
-                # first, exactly as before: a >= margin lead is a win signal.
+                # first: a >= margin lead is a win signal. Materially BALANCED
+                # cap games bootstrap the label from the last recorded
+                # full-search root value (white POV) instead of a hard draw --
+                # see the module docstring.
                 rwp = g.env.adjudicate()
                 if rwp == 0.0 and g.history:
-                    # Materially BALANCED at the cap: bootstrap the label from
-                    # the last recorded full-search root value (white POV,
-                    # in [-1,1]) instead of declaring a hard draw. A hard 0.0
-                    # taught the net that sub-margin advantages and slow wins
-                    # are worthless, capping endgame strength. Continuous
-                    # targets are fine for the MSE value loss.
                     rwp = float(g.history[-1][3])
         out = []
-        for (planes, policy_target, mover_sign, _v) in g.history:
-            out.append((planes, policy_target, np.float32(rwp * mover_sign)))
+        for (planes, policy_t, mover_sign, _v, ease_t, ease_m) in g.history:
+            out.append((planes, policy_t, np.float32(rwp * mover_sign),
+                        ease_t, ease_m))
         finished += 1
         if verbose:
             print(f"  game {finished}/{num_games}: {len(out)} positions "
@@ -292,8 +310,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         """Visit counts with this move's FORCED visits subtracted from every
         child except the most-visited one (KataGo's policy-target pruning).
         Forcing exists to firm up Q statistics, not to claim those moves
-        deserve probability mass; without pruning, the top-m tail of every
-        recorded target gets an artificial uniform floor."""
+        deserve probability mass."""
         raw = {ch.move: ch.visits for ch in root.children}
         if not g.forced_counts or not raw:
             return raw
@@ -318,12 +335,18 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         mover = env.board.sideToMove
         mover_sign = 1 if mover == "white" else -1
         # Only full-search moves become training targets; fast (capped) moves
-        # still advance the game but emit no policy row.
+        # still advance the game but emit no row.
         if g.is_full_move:
             planes = encode(env.board)
             policy_target = _policy_target(visit_counts, mover)
             v_white = _position_value_white(root, mover_sign)
-            g.history.append((planes, policy_target, mover_sign, v_white))
+            if ease_targets:
+                ease_t, ease_m = ease_target(root, g.force_n, ease_tau,
+                                              ease_target_mode, ease_gamma)
+            else:
+                ease_t, ease_m = np.float32(0.0), np.float32(0.0)
+            g.history.append((planes, policy_target, mover_sign, v_white,
+                              ease_t, ease_m))
 
         temp = 1.0 if g.ply < temp_moves else 0.0
         move = select_move(visit_counts, temp)
@@ -350,23 +373,21 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
 
     def _begin_move(g):
         """Start a new move: pick its simulation budget (playout-cap
-        randomization) and warm the tree. Only full-search moves become training
-        rows and get root Dirichlet noise. sims_done starts at the (possibly
-        reused) root's visit count -- 0 for a fresh root, or the carried subtree's
-        visits when reusing -- so the budget counts what the tree already holds."""
+        randomization; full moves carry the ease_extra_sims extension) and the
+        forced-visit configuration. sims_done starts at the (possibly reused)
+        root's visit count so the budget counts what the tree already holds."""
         full = move_rng.random() < full_search_prob
         g.is_full_move = full
         g.move_cap = full_cap if full else fast_cap
         g.sims_done = g.root.visits
-        # forced-visit bookkeeping resets every move; the floor applies only to
-        # full-search moves and auto-shrinks so forcing never eats more than
-        # half the move budget
         g.forced_set = None
         g.forced_counts = {}
+        g.force_m = 0
         g.force_n = 0
-        if full and root_force_m > 0 and root_force_visits > 0:
+        if full and full_force_m > 0 and root_force_visits > 0:
+            g.force_m = full_force_m
             g.force_n = min(int(root_force_visits),
-                            max(1, g.move_cap // (2 * root_force_m)))
+                            max(1, g.move_cap // (2 * full_force_m)))
         # A reused root is already expanded, so _expand never re-fires on it;
         # apply its root noise here instead (fresh roots get noise in _expand).
         if g.root.expanded and full and add_noise:
@@ -394,7 +415,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     if g.forced_set is None:
                         g.forced_set = sorted(node.children,
                                               key=lambda ch: ch.prior,
-                                              reverse=True)[:root_force_m]
+                                              reverse=True)[:g.force_m]
                     for ch in g.forced_set:
                         if ch.visits < g.force_n:
                             best = ch
@@ -529,24 +550,22 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            reuse_tree=True, full_search_prob=1.0,
                            fast_iterations=None,
                            root_force_m=8, root_force_visits=40,
+                           ease_targets=True, ease_tau=0.05,
+                           ease_target_mode="gap", ease_gamma=0.85,
+                           ease_extra_sims=300, ease_force_m=12,
                            verbose=True):
     """
-    Drop-in replacement for generate_games_parallel: same return type (flat list
-    of (planes, policy_target, value_target) examples) and the same adjudication
-    knobs. `concurrency` is the number of games run/batched simultaneously and is
-    the main lever on GPU batch size -- set it as high as GPU memory for the
-    forward pass allows.
+    Drop-in replacement for generate_games_parallel. Returns a flat list of
+    (planes, policy_target, value_target, ease_target, ease_mask) examples --
+    train with train_epoch(..., aux_ease=True). `concurrency` is the number of
+    games run/batched simultaneously (the main GPU batch-size lever).
 
-    `reuse_tree`, `full_search_prob` and `fast_iterations` control the two
-    self-play throughput options documented on run_selfplay. Defaults keep the
-    original behavior (reuse on but every move full-search + recorded); pass
-    full_search_prob<1 with fast_iterations set to enable playout-cap
-    randomization.
-
-    `root_force_m` / `root_force_visits` control forced root visits (see
-    run_selfplay). On by default (8 children by prior, floor of 40 visits, only
-    on full-search moves, pruned out of policy targets); root_force_m=0 restores
-    plain PUCT roots.
+    See run_selfplay for reuse_tree / playout-cap randomization, forced root
+    visits (root_force_m / root_force_visits) and the ease-target options
+    (ease_targets, ease_tau, ease_target_mode, ease_gamma, ease_extra_sims,
+    ease_force_m). Ease targets default ON with a "gap" statistic from a
+    widened 12-move floor and a +300-sim extended full-move budget; set
+    ease_tau from a probe_ease.py calibration.
     """
     if num_games <= 0:
         return []
@@ -560,5 +579,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         reuse_tree=reuse_tree, full_search_prob=full_search_prob,
         fast_iterations=fast_iterations,
         root_force_m=root_force_m, root_force_visits=root_force_visits,
+        ease_targets=ease_targets, ease_tau=ease_tau,
+        ease_target_mode=ease_target_mode, ease_gamma=ease_gamma,
+        ease_extra_sims=ease_extra_sims, ease_force_m=ease_force_m,
         verbose=verbose,
     )

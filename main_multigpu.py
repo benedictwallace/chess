@@ -240,8 +240,14 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
           f"{'off' if target_ratio == 0 else target_ratio}")
 
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"]).to(learner_device)
-    optimiser = torch.optim.Adam(net.parameters(), lr=cfg["lr"],
+    # disjoint optimisers -> fully decoupled gradient steps (see train_epoch)
+    main_params = [p for n, p in net.named_parameters() if "ease_" not in n]
+    ease_params = [p for n, p in net.named_parameters() if "ease_" in n]
+    optimiser = torch.optim.Adam(main_params, lr=cfg["lr"],
                                  weight_decay=cfg["weight_decay"])
+    ease_optimiser = torch.optim.Adam(ease_params,
+                                      lr=cfg.get("ease_lr", 1e-3),
+                                      weight_decay=cfg["weight_decay"])
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
     scaler = GradScaler("cuda", enabled=(learner_device.type == "cuda"))
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
@@ -258,9 +264,20 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     step = 0
     if os.path.exists(latest):
         ck = torch.load(latest, map_location=learner_device, weights_only=False)
-        net.load_state_dict(ck["model_state"])
-        if "optim_state" in ck:
-            optimiser.load_state_dict(ck["optim_state"])
+        missing, unexpected = net.load_state_dict(ck["model_state"],
+                                                  strict=False)
+        if missing:
+            print(f"  note: {len(missing)} params freshly initialised "
+                  f"(e.g. {missing[0]}) -- expected when resuming a "
+                  f"pre-ease-head checkpoint; the backbone is loaded.")
+        try:
+            if "optim_state" in ck:
+                optimiser.load_state_dict(ck["optim_state"])
+            if "ease_optim_state" in ck:
+                ease_optimiser.load_state_dict(ck["ease_optim_state"])
+        except Exception as e:
+            print(f"  note: optimizer state incompatible with the split "
+                  f"param groups ({e}); optimizers start fresh.")
         step = ck.get("train_step", ck.get("iteration", 0) * cfg["train_batches"])
         print(f"resumed at train_step {step}")
 
@@ -274,7 +291,8 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     if new_log:
         writer.writerow(["train_step", "iteration", "buffer", "consumed_total",
                          "replay_ratio",
-                         "loss_total", "loss_policy", "loss_value", "lr", "wall_sec"])
+                         "loss_total", "loss_policy", "loss_value", "loss_ease",
+                         "lr", "wall_sec"])
         mf.flush()
 
     ctx = mp.get_context("spawn")
@@ -343,6 +361,9 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
 
             losses = train_epoch(net, buffer, optimiser, learner_device,
                                  batches=train_block, batch_size=cfg["batch_size"],
+                                 aux_ease=True,
+                                 ease_weight=cfg.get("ease_loss_weight", 0.5),
+                                 ease_optimiser=ease_optimiser,
                                  scaler=scaler)
             step += train_block
 
@@ -355,20 +376,24 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                 writer.writerow([step, it, len(buffer), consumed_total,
                                  f"{ratio:.2f}",
                                  f"{losses['total']:.6f}", f"{losses['policy']:.6f}",
-                                 f"{losses['value']:.6f}", f"{lr:.3e}",
+                                 f"{losses['value']:.6f}", f"{losses['ease']:.6f}",
+                                 f"{lr:.3e}",
                                  f"{time.time()-t_start:.1f}"])
                 mf.flush()
                 print(f"  step {step}/{total_train_steps}  buf {len(buffer)}  "
                       f"consumed {consumed_total}  ratio {ratio:.1f}  "
                       f"loss {losses['total']:.4f} "
-                      f"(p {losses['policy']:.3f} v {losses['value']:.3f})  lr {lr:.2e}",
+                      f"(p {losses['policy']:.3f} v {losses['value']:.3f} "
+                      f"e {losses['ease']:.3f})  lr {lr:.2e}",
                       flush=True)
 
             if step - last_ckpt >= checkpoint_every_steps:
                 it = step // cfg["train_batches"]
                 ckpt = {"iteration": it, "train_step": step,
                         "model_state": net.state_dict(),
-                        "optim_state": optimiser.state_dict(), "config": cfg}
+                        "optim_state": optimiser.state_dict(),
+                        "ease_optim_state": ease_optimiser.state_dict(),
+                        "config": cfg}
                 _atomic_torch_save(ckpt, latest)
                 _atomic_torch_save(ckpt, os.path.join(cfg["checkpoint_dir"],
                                                       f"net_iter{it}.pt"))
@@ -386,7 +411,9 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
         it = step // cfg["train_batches"]
         ckpt = {"iteration": it, "train_step": step,
                 "model_state": net.state_dict(),
-                "optim_state": optimiser.state_dict(), "config": cfg}
+                "optim_state": optimiser.state_dict(),
+                "ease_optim_state": ease_optimiser.state_dict(),
+                "config": cfg}
         _atomic_torch_save(ckpt, latest)
         _atomic_torch_save(ckpt, os.path.join(cfg["checkpoint_dir"], f"net_iter{it}.pt"))
         mf.close()
@@ -433,6 +460,3 @@ if __name__ == "__main__":
          train_block=args.train_block, games_per_chunk=args.games_per_chunk,
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
-    
-
-    

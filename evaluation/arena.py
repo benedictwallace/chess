@@ -183,7 +183,7 @@ def load_net(path, device):
     # tolerate a stray torch.compile "_orig_mod." prefix in older checkpoints
     if any(k.startswith("_orig_mod.") for k in state):
         state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
-    # strict=False so removed aux heads (ease/cliff/stab) don't error -- but
+    # strict=False so removed/renamed aux heads (e.g. ease) don't error -- but
     # check the result, or a total key mismatch silently loads a RANDOM net.
     incompat = net.load_state_dict(state, strict=False)
     core_missing = [k for k in incompat.missing_keys

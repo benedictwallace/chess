@@ -44,8 +44,17 @@ class ScalarHead(nn.Module):
 
 
 class ChessNet(nn.Module):
-    def __init__(self, channels=64, num_blocks=5):
+    def __init__(self, channels=64, num_blocks=5, ease_detach=True):
         super().__init__()
+        # ease_detach=True (default): the ease head reads DETACHED trunk
+        # features, so its loss trains only ease_conv/bn/fc1/fc2 and
+        # contributes zero gradient to the stem, residual blocks, policy head,
+        # or value head -- they train exactly as if the ease head didn't
+        # exist. This keeps ease a pure readout: any later behaviour change
+        # must come from an explicit ease consumer, not from the aux loss
+        # silently reshaping the shared representation. Set False to let ease
+        # act as a KataGo-style auxiliary task that shapes the trunk.
+        self.ease_detach = ease_detach
 
         self.stem = nn.Sequential(
             nn.Conv2d(NUM_PLANES, channels, 3, padding=1, bias=False),
@@ -67,17 +76,19 @@ class ChessNet(nn.Module):
         self.value_fc1 = nn.Linear(1 * 8 * 8, 64)
         self.value_fc2 = nn.Linear(64, 1)
 
-        # ease head -> forgiveness (frac_safe) in [0, 1]  (unchanged keys)
-        # self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
-        # self.ease_bn = nn.BatchNorm2d(1)
-        # self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
-        # self.ease_fc2 = nn.Linear(64, 1)
+        # ease head -> forgiveness in [0, 1]  (unchanged keys)
+        self.ease_conv = nn.Conv2d(channels, 1, 1, bias=False)
+        self.ease_bn = nn.BatchNorm2d(1)
+        self.ease_fc1 = nn.Linear(1 * 8 * 8, 64)
+        self.ease_fc2 = nn.Linear(64, 1)
 
-        # # record-only heads, both in [0, 1]
-        # self.cliff_head = ScalarHead(channels, torch.sigmoid)  # cliff-size discounted return
-        # self.stab_head = ScalarHead(channels, torch.sigmoid)   # trajectory stability
-
-    def forward(self, x):
+    def forward(self, x, return_ease=False):
+        """Returns (policy_logits, value) by default -- every existing search /
+        arena / probe consumer unpacks a 2-tuple and stays untouched. Training
+        (and anything else that wants the forgiveness estimate) passes
+        return_ease=True for (policy_logits, value, ease) with ease already
+        sigmoid-activated in [0, 1], matching the masked-MSE loss in
+        training/train.py."""
         x = self.stem(x)
         for block in self.blocks:
             x = block(x)
@@ -91,12 +102,13 @@ class ChessNet(nn.Module):
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
 
-        # e = F.relu(self.ease_bn(self.ease_conv(x)))
-        # e = e.reshape(e.size(0), -1)
-        # e = F.relu(self.ease_fc1(e))
-        # ease = torch.sigmoid(self.ease_fc2(e))
+        if not return_ease:
+            return policy_logits, value
 
-        # cliff = self.cliff_head(x)
-        # stab = self.stab_head(x)
+        feat = x.detach() if self.ease_detach else x
+        e = F.relu(self.ease_bn(self.ease_conv(feat)))
+        e = e.reshape(e.size(0), -1)
+        e = F.relu(self.ease_fc1(e))
+        ease = torch.sigmoid(self.ease_fc2(e))
 
-        return policy_logits, value
+        return policy_logits, value, ease

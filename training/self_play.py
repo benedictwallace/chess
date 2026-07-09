@@ -1,17 +1,11 @@
 """
-Each example: (planes, policy_target, value_target,
-               ease_target, ease_mask,
-               cliff_target, cliff_mask,
-               stab_target, stab_mask)
+Each example: (planes, policy_target, value_target)
 
   value_target : game outcome from the mover's POV (signed by mover_sign)
-  ease_target  : frac_safe forgiveness in [0,1]   -- ABSOLUTE (unsigned)
-  cliff_target : cliff-size discounted return in [0,1] -- ABSOLUTE (unsigned)
-  stab_target  : trajectory stability in [0,1]    -- ABSOLUTE (unsigned)
-  *_mask       : 1.0 if the target is defined, else 0.0 (masked out of loss)
 
-All three auxiliary signals are RECORD-ONLY: trained as heads, never used to
-steer search.
+Legacy sequential self-play, policy/value only. Ease/forgiveness targets
+(action-gap and Q-entropy statistics from search/ease.py) are produced by
+training/self_play_batched.py, which is the maintained path.
 """
 
 import numpy as np
@@ -32,43 +26,6 @@ def _policy_target(visit_counts, sideToMove):
     return target
 
 
-def _forgiveness(root, min_visits=5, delta=0.1):
-    """frac_safe: share of well-visited root moves within `delta` of the best Q."""
-    qs = [c.value / c.visits for c in root.children if c.visits >= min_visits]
-    if len(qs) < 2:
-        return None
-    q_best = max(qs)
-    return sum(q >= q_best - delta for q in qs) / len(qs)
-
-
-def _cliff_return(node, gamma, min_visits):
-    """
-    Recursive cliff-size discounted return over the finished search tree.
-    local cliff = (best_Q - second_best_Q)/2 in [0,1] (cost of erring here);
-    aggregated as an exponentially-weighted average over the visit-weighted
-    future:  ease(n) = (1-gamma)*local + gamma * E_children[ease(child)].
-    """
-    kids = [c for c in node.children if c.visits >= min_visits]
-    if len(kids) >= 2:
-        qs = sorted((c.value / c.visits for c in kids), reverse=True)
-        local = (qs[0] - qs[1]) / 2.0
-    else:
-        local = 0.0
-    if not kids:
-        return local
-    tot = sum(c.visits for c in kids)
-    cont = sum((c.visits / tot) * _cliff_return(c, gamma, min_visits) for c in kids)
-    return (1.0 - gamma) * local + gamma * cont
-
-
-def _cliff_target(root, gamma=0.9, min_visits=5):
-    """Root cliff-return, or None when forgiveness is undefined at the root."""
-    kids = [c for c in root.children if c.visits >= min_visits]
-    if len(kids) < 2:
-        return None
-    return _cliff_return(root, gamma, min_visits)
-
-
 def _position_value_white(root, mover_sign):
     """Search-policy-weighted value (mover frame) converted to white's POV."""
     tot = sum(c.visits for c in root.children if c.visits > 0)
@@ -78,24 +35,8 @@ def _position_value_white(root, mover_sign):
     return v_mover * mover_sign
 
 
-def _trajectory_stability(values, t, horizon, scale=2.0):
-    """
-    Stability of position t = how little the white-POV value swings over the
-    next `horizon` plies of the ACTUAL game:  1 - mean|delta v| / scale, in
-    [0,1]. None when fewer than two values are available (near game end).
-    """
-    window = values[t: t + horizon + 1]
-    if len(window) < 2:
-        return None
-    deltas = [abs(window[i + 1] - window[i]) for i in range(len(window) - 1)]
-    mac = sum(deltas) / len(deltas)            # mean abs consecutive change, [0,2]
-    return max(0.0, 1.0 - mac / scale)
-
-
 def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
-              adj_margin=5.0, adj_plies=20,
-              ease_min_visits=5, ease_delta=0.1,
-              cliff_gamma=0.9, stab_horizon=8):
+              adj_margin=5.0, adj_plies=20):
     """Play one self-game; return training examples (3-tuples).
 
     adj_margin/adj_plies control early adjudication ("resignation"): a game in
@@ -126,12 +67,6 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
         # env.board.sideToMove is still the mover here: search() runs on clones
         # and never mutates the env passed in.
         policy_target = _policy_target(visit_counts, env.board.sideToMove)
-
-        #ez = _forgiveness(root, ease_min_visits, ease_delta)
-        #ease_target, ease_mask = (ez, 1.0) if ez is not None else (0.0, 0.0)
-
-        #cl = _cliff_target(root, cliff_gamma, ease_min_visits)
-        #cliff_target, cliff_mask = (cl, 1.0) if cl is not None else (0.0, 0.0)
 
         v_white = _position_value_white(root, mover_sign)
 
@@ -170,23 +105,13 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
         else:
             result_white_pov = result
 
-    # FIX: Point index to 3 instead of 7 since history tuple was shortened
-    values = [row[3] for row in history]        # white-POV value per ply
-
     examples = []
-    for t, (planes, policy_target, mover_sign, _v) in enumerate(history):
+    for planes, policy_target, mover_sign, _v in history:
         value_target = result_white_pov * mover_sign            # signed (mover POV)
-
-        # st = _trajectory_stability(values, t, stab_horizon)
-        # stab_target, stab_mask = (st, 1.0) if st is not None else (0.0, 0.0)
-
         examples.append((
             planes,
             policy_target,
             np.float32(value_target),
-            # np.float32(ease_target),  np.float32(ease_mask),
-            # np.float32(cliff_target), np.float32(cliff_mask),
-            # np.float32(stab_target),  np.float32(stab_mask),
         ))
 
     return examples

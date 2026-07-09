@@ -151,3 +151,4 @@ def select_move(visit_counts, temp=1.0):
     probs = logits / logits.sum()
     rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
+

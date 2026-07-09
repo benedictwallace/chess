@@ -86,10 +86,18 @@ CONFIG = dict(
     lr=1e-3,
     lr_min=1e-4,                # cosine-decay floor; LR goes lr -> lr_min over the run
     weight_decay=1e-4,
+    ease_lr=1e-3,               # ease head's OWN optimiser (constant LR; the
+                                # cosine schedule applies to the main
+                                # optimiser only)
+    ease_loss_weight=0.5,       # weight of the ease-head loss in the total.
+                                # Ease TARGET options (tau, gap/tree/flat mode,
+                                # extra root sims, floor width) live as
+                                # defaults on training/self_play_batched.py's
+                                # generate_games_batched.
 
     # io
     checkpoint_dir="checkpoints",
-    checkpoint_every=10,
+    checkpoint_every=5,
     metrics_file="metrics.csv",
     resume=True,                # auto-load latest.pt at startup if present
 )
@@ -126,8 +134,17 @@ def main(cfg=CONFIG):
     # keeps the kernel fusion benefit without the cudagraph fragility.
     net = torch.compile(net)
 
+    # DISJOINT optimisers: the main optimiser never contains the ease-head
+    # parameters and vice versa, so the two gradient steps in train_epoch are
+    # fully decoupled -- neither optimiser can ever move the other's params.
+    main_params = [p for n, p in net.named_parameters() if "ease_" not in n]
+    ease_params = [p for n, p in net.named_parameters() if "ease_" in n]
     optimiser = torch.optim.Adam(
-        net.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+        main_params, lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+    )
+    ease_optimiser = torch.optim.Adam(
+        ease_params, lr=cfg.get("ease_lr", 1e-3),
+        weight_decay=cfg["weight_decay"]
     )
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
 
@@ -150,9 +167,20 @@ def main(cfg=CONFIG):
         # weights were saved from the UNWRAPPED module (no "_orig_mod." prefix),
         # so load them back into the unwrapped module under torch.compile.
         target = getattr(net, "_orig_mod", net)
-        target.load_state_dict(ckpt["model_state"])
-        if "optim_state" in ckpt:
-            optimiser.load_state_dict(ckpt["optim_state"])
+        missing, unexpected = target.load_state_dict(ckpt["model_state"],
+                                                     strict=False)
+        if missing:
+            print(f"  note: {len(missing)} params freshly initialised "
+                  f"(e.g. {missing[0]}) -- expected when resuming a "
+                  f"pre-ease-head checkpoint; the backbone is loaded.")
+        try:
+            if "optim_state" in ckpt:
+                optimiser.load_state_dict(ckpt["optim_state"])
+            if "ease_optim_state" in ckpt:
+                ease_optimiser.load_state_dict(ckpt["ease_optim_state"])
+        except Exception as e:
+            print(f"  note: optimizer state incompatible with the split "
+                  f"param groups ({e}); optimizers start fresh.")
         start_it = ckpt.get("iteration", 0) + 1
         print(f"resumed from {latest_path} at iteration {ckpt.get('iteration')}, "
               f"continuing at {start_it}")
@@ -176,7 +204,7 @@ def main(cfg=CONFIG):
     if new_log:
         writer.writerow([
             "iteration", "buffer_size",
-            "loss_total", "loss_policy", "loss_value",
+            "loss_total", "loss_policy", "loss_value", "loss_ease",
             "selfplay_sec", "train_sec",
         ])
         metrics_f.flush()
@@ -217,17 +245,22 @@ def main(cfg=CONFIG):
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
+            aux_ease=True,
+            ease_weight=cfg.get("ease_loss_weight", 0.5),
+            ease_optimiser=ease_optimiser,
             scaler=scaler,
         )
         train_sec = time.time() - t0
 
         print(f"  loss total={losses['total']:.4f}  policy={losses['policy']:.4f}  "
-              f"value={losses['value']:.4f}  (train {train_sec:.1f}s)")
+              f"value={losses['value']:.4f}  ease={losses['ease']:.4f}  "
+              f"(train {train_sec:.1f}s)")
 
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
             f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
+            f"{losses['ease']:.6f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
         ])
         metrics_f.flush()
@@ -239,7 +272,9 @@ def main(cfg=CONFIG):
         # and evaluate a random network. Save the unwrapped module's keys.
         save_net = getattr(net, "_orig_mod", net)
         ckpt = {"iteration": it, "model_state": save_net.state_dict(),
-                "optim_state": optimiser.state_dict(), "config": cfg}
+                "optim_state": optimiser.state_dict(),
+                "ease_optim_state": ease_optimiser.state_dict(),
+                "config": cfg}
 
         # always overwrite "latest" so resuming is trivial
         torch.save(ckpt, os.path.join(cfg["checkpoint_dir"], "latest.pt"))
