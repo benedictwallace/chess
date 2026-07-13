@@ -21,16 +21,18 @@ class NeuralAgent:
     """
 
     def __init__(self, net, iterations=50, c=1.5,
-                 opening_plies=10, opening_temp=1.0):
+                 opening_plies=10, opening_temp=1.0, fpu_reduction=0.25):
         self.net = net
         self.iterations = iterations
         self.c = c
         self.opening_plies = opening_plies
         self.opening_temp = opening_temp
+        self.fpu_reduction = fpu_reduction
 
     def select(self, env, ply):
         _, visit_counts = search(
-            env, self.net, iterations=self.iterations, c=self.c, add_noise=False
+            env, self.net, iterations=self.iterations, c=self.c,
+            add_noise=False, fpu_reduction=self.fpu_reduction
         )
         if not visit_counts:
             return None

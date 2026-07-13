@@ -23,7 +23,10 @@ early-adjudication and ply-cap handling as training.self_play.play_game.
 
 EXAMPLES (changed): each recorded row is now a 5-tuple
     (planes, policy_target, value_target, ease_target, ease_mask)
-matching training.train's aux_ease path. ease_target is a search-derived
+matching training.train's aux_ease path -- with policy_target stored SPARSE as
+an (action_indices, probs) pair (an empty pair marks a value-only row from a
+playout-capped fast move; see record_fast_rows in run_selfplay). Value targets
+are blended lam*z + (1-lam)*Q_root (see value_target_lambda). ease_target is a search-derived
 forgiveness statistic of the ROOT position in [0, 1] (see below); ease_mask is
 1.0 where the statistic was computable and 0.0 otherwise (masked rows still
 train policy/value, contribute nothing to the ease loss).
@@ -91,7 +94,7 @@ import math
 import numpy as np
 
 from engine.gameEnv import Chess
-from model.encoding import encode
+from model.encoding import encode, encode_env
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
 from search.ease import ease_target
 
@@ -114,6 +117,25 @@ def _policy_target(visit_counts, sideToMove):
     for move, count in visit_counts.items():
         target[encodeMovePOV(move, sideToMove)] = count / total
     return target
+
+
+_EMPTY_POLICY = (np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32))
+
+
+def _policy_target_sparse(visit_counts, sideToMove):
+    """Policy target as (action_indices int32, probs float32) -- ~40 entries
+    instead of a dense NUM_ACTIONS (4672) float32 vector. This is what makes a
+    600k-row buffer (fast value-only rows included) cost ~3 GB instead of
+    ~14 GB. training.train._collate densifies per batch on the fly."""
+    total = sum(visit_counts.values())
+    if total == 0:
+        return _EMPTY_POLICY
+    idx = np.empty(len(visit_counts), dtype=np.int32)
+    pr = np.empty(len(visit_counts), dtype=np.float32)
+    for i, (move, count) in enumerate(visit_counts.items()):
+        idx[i] = encodeMovePOV(move, sideToMove)
+        pr[i] = count / total
+    return idx, pr
 
 
 def _position_value_white(root, mover_sign):
@@ -204,7 +226,8 @@ class _GameState:
         self.early_result = None
         self.sims_done = 0
         self.done = False
-        self.history = []   # (planes, policy_t, mover_sign, v_white, ease_t, ease_m)
+        self.history = []   # (planes, sparse_policy, mover_sign, v_white, ease_t, ease_m)
+                            # sparse_policy = (idx, probs); EMPTY pair -> value-only row
         self.move_cap = 0         # per-move simulation budget (set by _begin_move)
         self.is_full_move = True  # full-search move? only these become training rows
         self.chosen = None        # child node do_move picked (for subtree reuse)
@@ -224,21 +247,48 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  adj_margin=5.0, adj_plies=20,
                  use_cache=True, cache_cap=200_000,
                  reuse_tree=True, full_search_prob=1.0, fast_iterations=None,
-                 root_force_m=8, root_force_visits=40,
-                 ease_targets=True, ease_tau=0.05, ease_target_mode="gap",
-                 ease_gamma=0.85, ease_extra_sims=300, ease_force_m=12,
+                 root_force_m=6, root_force_visits=80,
+                 ease_targets=True, ease_tau=0.0313, ease_target_mode="gap",
+                 ease_gamma=0.85, ease_extra_sims=100, ease_force_m=6,
+                 fpu_reduction=0.25, value_target_lambda=0.7,
+                 record_fast_rows=True,
                  verbose=True):
     """
     Play `num_games` games, keeping up to `concurrency` of them running at once
     and batching their leaf evaluations.
 
     eval_fn(planes_list) -> (logits, values)
-        planes_list : list of (17,8,8) float32 arrays
+        planes_list : list of (19,8,8) float32 arrays
         logits      : array-like [B, NUM_ACTIONS]   (mover-POV policy logits)
         values      : array-like [B]                (mover-POV value in [-1,1])
 
     Returns a flat list of (planes, policy_target, value_target, ease_target,
-    ease_mask) examples -- the aux_ease format of training.train.
+    ease_mask) examples -- the aux_ease format of training.train -- where
+    policy_target is SPARSE: an (action_indices, probs) pair. Rows with an
+    EMPTY pair are value-only rows; training.train._collate gives them policy
+    weight 0 (value/ease train as normal).
+
+    VALUE-ONLY FAST ROWS (record_fast_rows, default on): playout-capped fast
+    moves -- 1-full_search_prob of all plies -- previously emitted nothing,
+    discarding ~75% of the game's positions. Their visit counts are useless as
+    policy targets (tiny budget, no noise, no forcing) but the position is
+    labelled by the SAME game outcome and its root value, so each is now
+    recorded as a value-only row (empty policy, ease_mask 0). ~4x value-head
+    data at the cost of one encode() per fast ply. Size the replay buffer for
+    the extra volume (rows/game grows ~4x).
+
+    VALUE TARGET BLENDING (value_target_lambda): every row's value target is
+        lam * z + (1 - lam) * Q_root      (both mover-POV)
+    where z is the final game outcome and Q_root the recorded position's own
+    search root value. lam=1 restores pure-outcome labels; 0.5-0.75 cuts the
+    dominant variance term of the value loss in a data-starved run (the KataGo
+    trick). The ply-cap bootstrap for materially balanced capped games is
+    unchanged (its z IS a root value).
+
+    FIRST-PLAY URGENCY (fpu_reduction): unvisited children score
+    parent-running-Q minus fpu_reduction instead of a flat 0, so search stops
+    over-exploring refuted moves whenever the side to move is worse. 0
+    restores legacy behavior. Applied at every tree node incl. the root.
 
     Throughput options: reuse_tree (carry the chosen child's searched subtree
     over as the next root; sound because the net is fixed for the whole call)
@@ -296,9 +346,14 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 if rwp == 0.0 and g.history:
                     rwp = float(g.history[-1][3])
         out = []
-        for (planes, policy_t, mover_sign, _v, ease_t, ease_m) in g.history:
-            out.append((planes, policy_t, np.float32(rwp * mover_sign),
-                        ease_t, ease_m))
+        lam = value_target_lambda
+        for (planes, policy_t, mover_sign, v_white, ease_t, ease_m) in g.history:
+            # blend the game outcome with the position's own search root value
+            # (both converted to the recorded mover's POV). lam=1 -> pure z.
+            z_mover = rwp * mover_sign
+            q_mover = v_white * mover_sign
+            target = lam * z_mover + (1.0 - lam) * q_mover
+            out.append((planes, policy_t, np.float32(target), ease_t, ease_m))
         finished += 1
         if verbose:
             print(f"  game {finished}/{num_games}: {len(out)} positions "
@@ -334,16 +389,23 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             return
         mover = env.board.sideToMove
         mover_sign = 1 if mover == "white" else -1
-        # Only full-search moves become training targets; fast (capped) moves
-        # still advance the game but emit no row.
-        if g.is_full_move:
-            planes = encode(env.board)
-            policy_target = _policy_target(visit_counts, mover)
+        # Full-search moves carry a real policy target (+ ease when enabled).
+        # Fast (playout-capped) moves are recorded as VALUE-ONLY rows when
+        # record_fast_rows: empty policy (their tiny no-noise search is not a
+        # policy target), ease mask 0, but the position still trains the value
+        # head on the blended outcome/root-value label.
+        if g.is_full_move or record_fast_rows:
+            planes = encode_env(env)
             v_white = _position_value_white(root, mover_sign)
-            if ease_targets:
-                ease_t, ease_m = ease_target(root, g.force_n, ease_tau,
-                                              ease_target_mode, ease_gamma)
+            if g.is_full_move:
+                policy_target = _policy_target_sparse(visit_counts, mover)
+                if ease_targets:
+                    ease_t, ease_m = ease_target(root, g.force_n, ease_tau,
+                                                  ease_target_mode, ease_gamma)
+                else:
+                    ease_t, ease_m = np.float32(0.0), np.float32(0.0)
             else:
+                policy_target = _EMPTY_POLICY
                 ease_t, ease_m = np.float32(0.0), np.float32(0.0)
             g.history.append((planes, policy_target, mover_sign, v_white,
                               ease_t, ease_m))
@@ -424,10 +486,25 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                             break
                 if best is None:
                     sqrt_pv = math.sqrt(node.visits)
+                    # first-play urgency: unvisited children assume the node's
+                    # running Q minus a penalty, not a flat 0 (see
+                    # search.puct.node_fpu_q for the sign/derivation; the
+                    # O(children) fallback runs only at roots, whose
+                    # moverSign==0 .value is 0/stale under subtree reuse).
+                    if node.moverSign != 0:
+                        fpu_q = -(node.value / node.visits) - fpu_reduction
+                    else:
+                        vsum = 0.0
+                        nsum = 0
+                        for ch in node.children:
+                            if ch.visits:
+                                vsum += ch.value
+                                nsum += ch.visits
+                        fpu_q = (vsum / nsum - fpu_reduction) if nsum else 0.0
                     best_score = -1e30
                     for ch in node.children:
                         v = ch.visits
-                        q = ch.value / v if v else 0.0
+                        q = ch.value / v if v else fpu_q
                         s = q + c * ch.prior * sqrt_pv / (1 + v)
                         if s > best_score:
                             best_score = s
@@ -457,8 +534,15 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 continue
 
             mover = env.board.sideToMove
+            # The net input now includes the halfmove clock and repetition
+            # count, so the eval cache MUST key on them too -- two visits to
+            # the same board with different counters are different net inputs.
+            # (This costs cache hit-rate on repetition revisits; that loss is
+            # correctness, not waste: the net SHOULD re-evaluate rep=2 lower.)
+            bkey = env.board.stateKey()
+            rep = env.counts.get(bkey, 1)
             if cache is not None:
-                key = env.board.stateKey()
+                key = (bkey, env.halfmove_clock, rep)
                 hit = cache.get(key)
                 if hit is not None:
                     priors, value = hit
@@ -468,20 +552,20 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     g.sims_done += 1
                     continue
 
-            batch_planes.append(encode(env.board))
-            batch_meta.append((g, node, env, legal, path, mover))
+            batch_planes.append(encode(env.board, env.halfmove_clock, rep))
+            batch_meta.append((g, node, env, legal, path, mover, bkey, rep))
 
         # ---- single batched network forward ----
         if batch_planes:
             logits_b, values_b = eval_fn(batch_planes)
-            for (g, node, env, legal, path, mover), logits, value in zip(
+            for (g, node, env, legal, path, mover, bkey, rep), logits, value in zip(
                     batch_meta, logits_b, values_b):
                 idxs = [encodeMovePOV(m, mover) for m in legal]
                 probs = _softmax(np.asarray(logits)[idxs])
                 priors = {m: float(p) for m, p in zip(legal, probs)}
                 value = float(value)
                 if cache is not None and len(cache) < cache_cap:
-                    cache[env.board.stateKey()] = (priors, value)
+                    cache[(bkey, env.halfmove_clock, rep)] = (priors, value)
                 _expand(node, priors, mover, add_noise and g.is_full_move,
                         node is g.root, dirichlet_alpha, noise_frac)
                 _backprop(path, value if mover == "white" else -value)
@@ -549,10 +633,12 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            use_cache=True, cache_cap=200_000,
                            reuse_tree=True, full_search_prob=1.0,
                            fast_iterations=None,
-                           root_force_m=8, root_force_visits=40,
-                           ease_targets=True, ease_tau=0.05,
+                           root_force_m=6, root_force_visits=80,
+                           ease_targets=True, ease_tau=0.0313,
                            ease_target_mode="gap", ease_gamma=0.85,
-                           ease_extra_sims=300, ease_force_m=12,
+                           ease_extra_sims=100, ease_force_m=6,
+                           fpu_reduction=0.25, value_target_lambda=0.7,
+                           record_fast_rows=True,
                            verbose=True):
     """
     Drop-in replacement for generate_games_parallel. Returns a flat list of
@@ -563,9 +649,14 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
     See run_selfplay for reuse_tree / playout-cap randomization, forced root
     visits (root_force_m / root_force_visits) and the ease-target options
     (ease_targets, ease_tau, ease_target_mode, ease_gamma, ease_extra_sims,
-    ease_force_m). Ease targets default ON with a "gap" statistic from a
-    widened 12-move floor and a +300-sim extended full-move budget; set
-    ease_tau from a probe_ease.py calibration.
+    ease_force_m). Ease targets default ON with a "gap" statistic. Defaults
+    (probe_ease-calibrated tau=0.0313; DEEP-NOT-WIDE floor: 6 forced children,
+    80-visit ceiling; +100-sim budget) follow the noise analysis: the gap
+    statistic only needs the TOP-2 Qs to be trustworthy, so the forced budget
+    buys more per sim as depth-per-child than as width. The effective floor is
+    min(root_force_visits, (iterations+ease_extra_sims) // (2*m)) -- with the
+    defaults min(80, 800//12) = 66 visits/child. Judge label quality by the
+    ease_R2 column train_epoch now reports, not by the raw ease MSE.
     """
     if num_games <= 0:
         return []
@@ -582,5 +673,7 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         ease_targets=ease_targets, ease_tau=ease_tau,
         ease_target_mode=ease_target_mode, ease_gamma=ease_gamma,
         ease_extra_sims=ease_extra_sims, ease_force_m=ease_force_m,
+        fpu_reduction=fpu_reduction, value_target_lambda=value_target_lambda,
+        record_fast_rows=record_fast_rows,
         verbose=verbose,
     )

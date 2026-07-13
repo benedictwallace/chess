@@ -4,9 +4,11 @@ import torch.nn.functional as F
 from model.move_encoding import NUM_ACTIONS
 
 # Must match model.encoding.NUM_PLANES (the conv stem's in-channels = encoded
-# planes). 17 = 12 piece planes + 4 castling + 1 en passant; no side-to-move
-# plane, since the board is canonicalised to the mover's POV.
-NUM_PLANES = 17
+# planes). 19 = 12 piece planes + 4 castling + 1 en passant + halfmove clock
+# + repetition count; no side-to-move plane, since the board is canonicalised
+# to the mover's POV. NOTE: 19-plane nets cannot load 17-plane checkpoints
+# (the stem's in-channels changed) -- this is a fresh-run change.
+NUM_PLANES = 19
 
 
 class ResidualBlock(nn.Module):
@@ -112,3 +114,4 @@ class ChessNet(nn.Module):
         ease = torch.sigmoid(self.ease_fc2(e))
 
         return policy_logits, value, ease
+        

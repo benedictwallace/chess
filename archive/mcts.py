@@ -121,3 +121,4 @@ if __name__ == "__main__":
     # Run MCTS for a single move
     move = mctsSearch(env, iterations=500)
     print(f"MCTS chose: {move}")
+    

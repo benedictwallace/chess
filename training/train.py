@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 
+from model.move_encoding import NUM_ACTIONS
+
 
 class ReplayBuffer:
     def __init__(self, capacity=50_000):
@@ -26,24 +28,47 @@ def _collate(batch, device, aux_ease=False):
     """
     Examples are (planes, policy, value) or, with aux_ease,
     (planes, policy, value, ease_target, ease_mask).
+
+    `policy` per row is either a dense (NUM_ACTIONS,) float32 array (legacy
+    self_play.py rows) or a SPARSE (action_indices, probs) pair (batched
+    self-play). Sparse rows are densified here, per batch. An EMPTY sparse
+    pair (or an all-zero dense row) is a VALUE-ONLY row: it gets policy-mask 0
+    so it contributes nothing to the policy loss but trains value/ease as
+    normal.
+
+    Returns (planes, policy, pmask, value[, ease, emask]) -- pmask is (B,1).
     """
-    planes = np.stack([b[0] for b in batch])               # (B,17,8,8)
-    policy = np.stack([b[1] for b in batch])               # (B,NUM_ACTIONS)
+    B = len(batch)
+    planes = np.stack([b[0] for b in batch])               # (B,19,8,8)
+    policy = np.zeros((B, NUM_ACTIONS), dtype=np.float32)  # (B,NUM_ACTIONS)
+    pmask  = np.zeros(B, dtype=np.float32)                 # (B,)
+    for i, b in enumerate(batch):
+        p = b[1]
+        if isinstance(p, tuple):                           # sparse (idx, probs)
+            idx, pr = p
+            if len(idx):
+                policy[i, idx] = pr
+                pmask[i] = 1.0
+        else:                                              # legacy dense row
+            policy[i] = p
+            if p.sum() > 0:
+                pmask[i] = 1.0
     value  = np.array([b[2] for b in batch], np.float32)   # (B,)
 
     t = lambda a: torch.from_numpy(a).to(device)
     planes = t(planes)
     policy = t(policy)
+    pmask  = t(pmask).unsqueeze(1)
     value  = t(value).unsqueeze(1)
 
     if not aux_ease:
-        return planes, policy, value
+        return planes, policy, pmask, value
 
     ease  = np.array([b[3] for b in batch], np.float32)
     emask = np.array([b[4] for b in batch], np.float32)
     ease  = t(ease).unsqueeze(1)
     emask = t(emask).unsqueeze(1)
-    return planes, policy, value, ease, emask
+    return planes, policy, pmask, value, ease, emask
 
 
 def _masked_mse(pred, target, mask):
@@ -95,6 +120,15 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
     net.train()
     acc = dict(total=0.0, policy=0.0, value=0.0, ease=0.0)
     actual = 0
+    # masked ease-target statistics, accumulated over the whole epoch. The raw
+    # ease MSE is uninterpretable on its own (its floor is the label noise);
+    # what matters is the fit relative to the target spread:
+    #     ease_R2 = 1 - MSE / Var(target).
+    # R2 ~ 0  -> the head predicts no better than the batch mean: either the
+    #            labels are noise at this tau/floor or the head can't read the
+    #            needed feature from the (detached) trunk.
+    # R2 -> 1 -> the head explains the target variance.
+    e_w = e_t = e_t2 = e_se = 0.0
 
     for _ in range(batches):
         if len(buffer) == 0:
@@ -103,9 +137,9 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
         batch = buffer.sample(batch_size)
         collated = _collate(batch, device, aux_ease=aux_ease)
         if aux_ease:
-            planes, policy_t, value_t, ease_t, emask = collated
+            planes, policy_t, pmask, value_t, ease_t, emask = collated
         else:
-            planes, policy_t, value_t = collated
+            planes, policy_t, pmask, value_t = collated
 
         optimiser.zero_grad()
         if ease_optimiser is not None:
@@ -119,13 +153,27 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             policy_logits, value_p = out[0], out[1]
 
             log_probs = F.log_softmax(policy_logits, dim=1)
-            policy_loss = -(policy_t * log_probs).sum(dim=1).mean()
+            # Per-row cross-entropy, averaged over POLICY rows only (pmask).
+            # A plain .mean() would dilute the policy gradient by the fraction
+            # of value-only rows in the batch (~75% with record_fast_rows), so
+            # normalize by the mask sum -- the policy signal per policy row is
+            # then identical to a run without value-only rows.
+            ce = -(policy_t * log_probs).sum(dim=1, keepdim=True)     # (B,1)
+            policy_loss = (ce * pmask).sum() / pmask.sum().clamp(min=1.0)
             value_loss = F.mse_loss(value_p, value_t)
             loss_pv = policy_loss + value_loss
 
             ease_loss = None
             if aux_ease:
                 ease_loss = _masked_mse(out[2], ease_t, emask)
+                with torch.no_grad():
+                    w = emask.float()
+                    t = ease_t.float()
+                    p = out[2].detach().float()
+                    e_w += w.sum().item()
+                    e_t += (w * t).sum().item()
+                    e_t2 += (w * t * t).sum().item()
+                    e_se += (w * (p - t) ** 2).sum().item()
 
         if decoupled:
             # ---- step 1: trunk + policy + value (ease graph untouched) ----
@@ -153,6 +201,16 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             acc["ease"] += ease_loss.item()
         actual += 1
 
+    ease_stats = dict(ease_R2=0.0, ease_tvar=0.0, ease_tmean=0.0)
+    if e_w > 0:
+        tmean = e_t / e_w
+        tvar = max(e_t2 / e_w - tmean * tmean, 0.0)
+        mse = e_se / e_w
+        ease_stats["ease_tmean"] = tmean
+        ease_stats["ease_tvar"] = tvar
+        # guard: a (near-)constant target makes R2 meaningless; report 0
+        ease_stats["ease_R2"] = (1.0 - mse / tvar) if tvar > 1e-6 else 0.0
+
     if actual == 0:
-        return {k: 0.0 for k in acc}
-    return {k: v / actual for k, v in acc.items()}
+        return {**{k: 0.0 for k in acc}, **ease_stats}
+    return {**{k: v / actual for k, v in acc.items()}, **ease_stats}

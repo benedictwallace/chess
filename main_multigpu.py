@@ -80,7 +80,7 @@ from torch.amp import GradScaler
 from model.network import ChessNet
 from training.self_play_batched import generate_games_batched
 from training.train import ReplayBuffer, train_epoch
-from main import CONFIG, cosine_lr
+from main import CONFIG, cosine_lr, open_metrics
 
 
 SPOOL_GLOB = "chunk_*.pkl"
@@ -168,6 +168,16 @@ def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 reuse_tree=cfg["reuse_tree"],
                 full_search_prob=cfg["full_search_prob"],
                 fast_iterations=cfg["fast_search_iterations"],
+                root_force_m=cfg["root_force_m"],
+                root_force_visits=cfg["root_force_visits"],
+                ease_targets=cfg["ease_targets"], ease_tau=cfg["ease_tau"],
+                ease_target_mode=cfg["ease_target_mode"],
+                ease_gamma=cfg["ease_gamma"],
+                ease_extra_sims=cfg["ease_extra_sims"],
+                ease_force_m=cfg["ease_force_m"],
+                fpu_reduction=cfg["fpu_reduction"],
+                value_target_lambda=cfg["value_target_lambda"],
+                record_fast_rows=cfg["record_fast_rows"],
                 verbose=False)
         except Exception as e:                # e.g. CUDA OOM: back off, stay alive
             print(f"[actor {os.getpid()}] self-play error, backing off: {e}",
@@ -284,16 +294,13 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     _atomic_torch_save({"model_state": net.state_dict()}, pub_path)  # before actors
 
     # metrics
+    header = ["train_step", "iteration", "buffer", "consumed_total",
+              "replay_ratio",
+              "loss_total", "loss_policy", "loss_value", "loss_ease",
+              "ease_R2", "ease_tvar",
+              "lr", "ease_lr", "wall_sec"]
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
-    new_log = not os.path.exists(metrics_path)
-    mf = open(metrics_path, "a", newline="")
-    writer = csv.writer(mf)
-    if new_log:
-        writer.writerow(["train_step", "iteration", "buffer", "consumed_total",
-                         "replay_ratio",
-                         "loss_total", "loss_policy", "loss_value", "loss_ease",
-                         "lr", "wall_sec"])
-        mf.flush()
+    mf, writer, metrics_path = open_metrics(metrics_path, header)
 
     ctx = mp.get_context("spawn")
     threads = max(1, (os.cpu_count() or n_actors) // max(1, n_actors))
@@ -358,6 +365,11 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
             lr = cosine_lr(step + 1, cfg["lr"], cfg["lr_min"], total_train_steps)
             for grp in optimiser.param_groups:
                 grp["lr"] = lr
+            ease_lr = cosine_lr(step + 1, cfg["ease_lr"],
+                                cfg.get("ease_lr_min", cfg["ease_lr"]),
+                                total_train_steps)
+            for grp in ease_optimiser.param_groups:
+                grp["lr"] = ease_lr
 
             losses = train_epoch(net, buffer, optimiser, learner_device,
                                  batches=train_block, batch_size=cfg["batch_size"],
@@ -377,14 +389,16 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                                  f"{ratio:.2f}",
                                  f"{losses['total']:.6f}", f"{losses['policy']:.6f}",
                                  f"{losses['value']:.6f}", f"{losses['ease']:.6f}",
-                                 f"{lr:.3e}",
+                                 f"{losses['ease_R2']:.4f}", f"{losses['ease_tvar']:.5f}",
+                                 f"{lr:.3e}", f"{ease_lr:.3e}",
                                  f"{time.time()-t_start:.1f}"])
                 mf.flush()
                 print(f"  step {step}/{total_train_steps}  buf {len(buffer)}  "
                       f"consumed {consumed_total}  ratio {ratio:.1f}  "
                       f"loss {losses['total']:.4f} "
                       f"(p {losses['policy']:.3f} v {losses['value']:.3f} "
-                      f"e {losses['ease']:.3f})  lr {lr:.2e}",
+                      f"e {losses['ease']:.3f} R2 {losses['ease_R2']:+.2f})  "
+                      f"lr {lr:.2e}",
                       flush=True)
 
             if step - last_ckpt >= checkpoint_every_steps:

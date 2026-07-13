@@ -11,7 +11,7 @@ training/self_play_batched.py, which is the maintained path.
 import numpy as np
 
 from engine.gameEnv import Chess
-from model.encoding import encode
+from model.encoding import encode_env
 from model.move_encoding import encodeMove, encodeMovePOV, NUM_ACTIONS
 from search.puct import search, select_move
 
@@ -58,7 +58,7 @@ def play_game(net, iterations, max_plies=200, temp_moves=30, c=1.5,
             break
 
         mover_sign = 1 if env.board.sideToMove == "white" else -1
-        planes = encode(env.board)
+        planes = encode_env(env)
 
         root, visit_counts = search(env, net, iterations=iterations, c=c, add_noise=True)
         if not visit_counts:

@@ -2,7 +2,7 @@ import math
 import torch
 import numpy as np
 
-from model.encoding import encode
+from model.encoding import encode_env
 from model.move_encoding import encodeMove, encodeMovePOV, NUM_ACTIONS
 from engine.moves import Move
 
@@ -33,15 +33,15 @@ def evaluate(net, env, legal=None):
     if not legal:
         return {}, 0.0
 
-    planes = encode(board)
-    
+    planes = encode_env(env)   # includes the halfmove-clock / repetition planes
+
     # Intercept evaluation if utilizing centralized process batching
     if hasattr(net, "is_proxy") and net.is_proxy:
         policy_logits_np, value = net.evaluate_remote(planes)
         logits = torch.from_numpy(policy_logits_np)
     else:
         # Standard structural fallback execution path
-        x = torch.from_numpy(planes).unsqueeze(0) # (1, 18, 8, 8)
+        x = torch.from_numpy(planes).unsqueeze(0) # (1, 19, 8, 8)
         x = x.to(next(net.parameters()).device)
         net.eval()
         with torch.no_grad():
@@ -72,12 +72,41 @@ class Node:
         self.expanded = False 
 
 
-def puctScore(child, parent, c=1.5):
+def node_fpu_q(node, fpu_reduction):
+    """First-play urgency: the Q an UNVISITED child of `node` is assumed to
+    have, from the perspective of the player choosing at `node`.
+
+    Plain PUCT's q=0 for unvisited children is a hidden bias: when the chooser
+    is losing (parent Q < 0) every unexplored move looks better than reality
+    and simulations get sprayed across refuted alternatives. Instead, assume an
+    untried move is slightly WORSE (by fpu_reduction) than the running value of
+    the moves already explored from this node (LC0/KataGo-style FPU).
+
+    node.value is accumulated from the perspective of the player who moved
+    INTO the node -- the chooser's opponent -- so for internal nodes the
+    chooser-POV average is just its negation. Root nodes carry moverSign == 0
+    (their .value stays 0 / goes stale under subtree reuse), so the root falls
+    back to a visit-weighted average over its children, whose values are
+    already chooser-POV. That O(children) pass runs only at the root.
     """
-    PUCT: exploitation + prior-weighted exploration.
+    if node.moverSign != 0 and node.visits > 0:
+        return -(node.value / node.visits) - fpu_reduction
+    vsum = 0.0
+    nsum = 0
+    for ch in node.children:
+        if ch.visits:
+            vsum += ch.value
+            nsum += ch.visits
+    return (vsum / nsum - fpu_reduction) if nsum else 0.0
+
+
+def puctScore(child, parent, c=1.5, fpu_q=0.0):
+    """
+    PUCT: exploitation + prior-weighted exploration. `fpu_q` is the assumed Q
+    for an unvisited child (see node_fpu_q); pass 0.0 for the legacy behavior.
     """
     if child.visits == 0:
-        q = 0.0
+        q = fpu_q
     else:
         q = child.value / child.visits
     u = c * child.prior * math.sqrt(parent.visits) / (1 + child.visits)
@@ -85,9 +114,10 @@ def puctScore(child, parent, c=1.5):
 
 
 def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
-               noise_frac=0.25) -> tuple[Node, dict[Move, int]]:
+               noise_frac=0.25, fpu_reduction=0.25) -> tuple[Node, dict[Move, int]]:
     """
-    Executes MCTS iteration steps.
+    Executes MCTS iteration steps. fpu_reduction: first-play-urgency penalty
+    for unvisited children (see node_fpu_q); 0 restores the legacy q=0 init.
     """
     root = Node()
     root.moverSign = 0
@@ -99,7 +129,9 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
 
         # 1. SELECTION: descend via PUCT until an unexpanded or terminal node
         while node.expanded and not node.terminal and node.children:
-            node = max(node.children, key=lambda ch: puctScore(ch, node, c))
+            fpu_q = node_fpu_q(node, fpu_reduction)   # once per node, not per child
+            node = max(node.children,
+                       key=lambda ch: puctScore(ch, node, c, fpu_q))
             env.step(node.move)
             path.append(node)
 
@@ -151,4 +183,3 @@ def select_move(visit_counts, temp=1.0):
     probs = logits / logits.sum()
     rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
-

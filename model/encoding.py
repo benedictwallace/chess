@@ -1,11 +1,21 @@
 import numpy as np
 
 
-# Plane Layout (17 planes):
+# Plane Layout (19 planes):
 #   0-5  : current player pieces (pawn, bishop, knight, rook, queen, king)
 #   6-11 : opponent pieces       (pawn, bishop, knight, rook, queen, king)
 #   12-15: castling rights (own kingside, own queenside, opp kingside, opp queenside)
 #   16   : en passant target sq
+#   17   : halfmove clock / 100 (uniform fill; 1.0 == fifty-move draw imminent)
+#   18   : repetition count, (occurrences-1)/2 (uniform fill; 0.5 == this is the
+#          2nd occurrence, 1.0 == threefold is one repeat away / already claimed)
+#
+# Planes 17-18 exist because SEARCH scores repetitions and the fifty-move rule
+# as hard terminal draws, but a clock-blind net cannot see either coming: the
+# value head was systematically wrong near rule-draws (grinding endgames,
+# perpetual-check defenses). Both are env-level counters, not Board state, so
+# encode() takes them as arguments -- use encode_env(env) whenever you hold the
+# Chess env (every search/self-play/eval path does).
 #
 # ORIENTATION: the board is canonicalised to the MOVER's point of view with a
 # RANK-ONLY (vertical) flip -- rank r <-> rank 7-r, FILE UNCHANGED. This mirrors
@@ -28,7 +38,7 @@ import numpy as np
 # network.NUM_PLANES together -- they must match the conv stem's in-channels.)
 
 PIECE_ORDER = ["pawn", "bishop", "knight", "rook", "queen", "king"]
-NUM_PLANES = 17
+NUM_PLANES = 19
 
 def _square_to_rc(square: int, flip: bool) -> tuple[int, int]:
     """
@@ -54,10 +64,16 @@ def _fill_plane(plane: np.ndarray, bb: int, flip: bool) -> None:
         plane[rank, file] = 1.0
         bb &= bb - 1
 
-def encode(board) -> np.ndarray:
+def encode(board, halfmove_clock: int = 0, repetitions: int = 1) -> np.ndarray:
     """
-    Encode the board onto a 17 x 8 x 8 float32 tensor,
-    oriented from the perspective of the side to move (rank-only flip for black).
+    Encode the board onto a 19 x 8 x 8 float32 tensor, oriented from the
+    perspective of the side to move (rank-only flip for black).
+
+    halfmove_clock : plies since the last capture/pawn move (fifty-move rule).
+    repetitions    : how many times this exact position has occurred INCLUDING
+                     the current occurrence (the Chess env's counts value, so
+                     1 == first time). Defaults (0, 1) reproduce a "fresh"
+                     position; prefer encode_env(env) which fills both.
     """
 
     planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
@@ -92,4 +108,23 @@ def encode(board) -> np.ndarray:
         rank, file = _square_to_rc(board.enPassantSq, flip)
         planes[16, rank, file] = 1.0
 
+    # rule-draw counters (uniform planes, like castling rights). Clamped so the
+    # encoding stays in [0, 1] even for malformed inputs.
+    planes[17, :, :] = min(max(int(halfmove_clock), 0), 100) / 100.0
+    planes[18, :, :] = min(max(int(repetitions) - 1, 0), 2) / 2.0
+
     return planes
+
+
+def repetition_count(env) -> int:
+    """Occurrences of the env's CURRENT position (>= 1), from its threefold
+    bookkeeping."""
+    return env.counts.get(env.board.stateKey(), 1)
+
+
+def encode_env(env) -> np.ndarray:
+    """encode() with the halfmove clock and repetition count read off a Chess
+    env. This is the canonical entry point for every search / self-play / eval
+    path -- calling encode(board) directly zeroes the rule-draw planes and the
+    net will misjudge positions near a repetition or fifty-move draw."""
+    return encode(env.board, env.halfmove_clock, repetition_count(env))

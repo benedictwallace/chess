@@ -22,8 +22,9 @@ What it does:
        eff_actions = exp(H)           H = entropy of softmax(Q / tau) --
                                       "effective number of good moves"
        ease_entropy                   H normalized to [0,1] by log(#qualified)
-       F_tree, F_flat                 the recursive / subtree aggregates of
-                                      the gap statistic (--gamma)
+       F_tree_gap, F_flat_gap         the recursive / flat-subtree aggregates
+       F_tree_entropy, F_flat_entropy of EACH local statistic ("tree" uses
+                                      the --gamma decay; "flat" is implicit)
   4. Writes everything (with FENs) to a CSV for visualization, prints summary
      percentiles, an ASCII histogram of F_gap, and the most brittle / most
      forgiving positions found.
@@ -52,7 +53,8 @@ import numpy as np
 import torch
 
 from engine.gameEnv import Chess
-from model.encoding import encode
+from model.encoding import encode_env
+from search.puct import node_fpu_q
 from model.move_encoding import encodeMovePOV
 from evaluation.arena import load_net
 from training.self_play_batched import (
@@ -132,7 +134,7 @@ def harvest_positions(eval_fn, n_positions, *, min_ply=6, max_ply=140,
         for g in games:
             if g.env.isTerminal():
                 g.__init__(rng, min_ply, max_ply)
-            planes.append(encode(g.env.board))
+            planes.append(encode_env(g.env))
             metas.append(g)
         logits_b, _ = eval_fn(planes)
         for g, logits in zip(metas, logits_b):
@@ -173,7 +175,7 @@ class _ProbeItem:
         self.forced_set = None
 
 
-def search_positions(items, eval_fn, *, sims=700, c=1.5,
+def search_positions(items, eval_fn, *, sims=700, c=1.5, fpu_reduction=0.25,
                      force_m=8, force_n=40, verbose=True, tag=""):
     """One forced-visit PUCT search per item, batched across items (one
     simulation per item per round, single network forward per round). Returns
@@ -209,10 +211,11 @@ def search_positions(items, eval_fn, *, sims=700, c=1.5,
                             break
                 if best is None:
                     sqrt_pv = math.sqrt(node.visits)
+                    fpu_q = node_fpu_q(node, fpu_reduction)
                     best_score = -1e30
                     for ch in node.children:
                         v = ch.visits
-                        q = ch.value / v if v else 0.0
+                        q = ch.value / v if v else fpu_q
                         s = q + c * ch.prior * sqrt_pv / (1 + v)
                         if s > best_score:
                             best_score = s
@@ -240,7 +243,7 @@ def search_positions(items, eval_fn, *, sims=700, c=1.5,
                 it.sims += 1
                 continue
 
-            batch_planes.append(encode(env.board))
+            batch_planes.append(encode_env(env))
             batch_meta.append((it, node, env, legal, path,
                                env.board.sideToMove))
 
@@ -335,7 +338,8 @@ def main():
                     help="temperature for F_gap and the Q-entropy; 0 = "
                          "auto-calibrate so the median gap maps to F = 0.5")
     ap.add_argument("--gamma", type=float, default=0.85,
-                    help="decay in the recursive tree forgiveness F_tree")
+                    help="decay in the recursive tree forgiveness "
+                         "(F_tree_gap and F_tree_entropy)")
     ap.add_argument("--concurrency", type=int, default=128,
                     help="positions searched simultaneously per chunk")
     ap.add_argument("--min-ply", type=int, default=6)
@@ -409,11 +413,13 @@ def main():
     rows = []
     for it, st in results:
         ease = ease_from_qs(st["qs"], tau)
-        # tree statistics must be computed HERE, while it.root still holds the
-        # low-budget tree (a --sims-hi re-search resets the roots)
-        f_tree = tree_forgiveness(it.root, args.gamma, tau)
-        f_flat = flat_forgiveness(it.root, tau)
+        # tree/flat statistics must be computed HERE, while it.root still holds
+        # the low-budget tree (a --sims-hi re-search resets the roots).
+        # Both recursive formulations, on BOTH local statistics:
+        f_tree_gap = tree_forgiveness(it.root, args.gamma, tau, stat="gap")
+        f_flat_gap = flat_forgiveness(it.root, tau, stat="gap")
         f_tree_ent = tree_forgiveness(it.root, args.gamma, tau, stat="entropy")
+        f_flat_ent = flat_forgiveness(it.root, tau, stat="entropy")
         rows.append({
             "ply": it.ply,
             "side": it.env.board.sideToMove,
@@ -423,17 +429,20 @@ def main():
             "q2": round(st["qs"][1], 4) if len(st["qs"]) > 1 else "",
             "gap": round(ease["gap"], 4),
             "F_gap": round(ease["F_gap"], 4),
-            "F_tree": round(f_tree, 4) if f_tree is not None else "",
-            "F_flat": round(f_flat, 4) if f_flat is not None else "",
-            "F_tree_entropy": round(f_tree_ent, 4) if f_tree_ent is not None else "",
             "eff_actions": round(ease["eff_actions"], 3),
             "ease_entropy": round(ease["ease_entropy"], 4),
+            "F_tree_gap": round(f_tree_gap, 4) if f_tree_gap is not None else "",
+            "F_flat_gap": round(f_flat_gap, 4) if f_flat_gap is not None else "",
+            "F_tree_entropy": round(f_tree_ent, 4) if f_tree_ent is not None else "",
+            "F_flat_entropy": round(f_flat_ent, 4) if f_flat_ent is not None else "",
             "best_move": st["best_move"],
             "fen": it.fen,
         })
 
     # ---- cross-statistic rank agreement: do the measures even disagree? ----
-    stat_cols = ["F_gap", "ease_entropy", "F_tree", "F_flat", "F_tree_entropy"]
+    stat_cols = ["F_gap", "ease_entropy",
+                 "F_tree_gap", "F_flat_gap",
+                 "F_tree_entropy", "F_flat_entropy"]
     complete = [r for r in rows if all(r[c] != "" for c in stat_cols)]
     if len(complete) > 10:
         arrs = {c: np.asarray([float(r[c]) for r in complete]) for c in stat_cols}
@@ -491,6 +500,11 @@ def main():
     eff = [r["eff_actions"] for r in rows]
     print(f"effective actions exp(H): mean {np.mean(eff):.2f}, "
           f"median {np.median(eff):.2f}")
+    for col in ("F_tree_gap", "F_flat_gap", "F_tree_entropy", "F_flat_entropy"):
+        vals = [float(r[col]) for r in rows if r[col] != ""]
+        if vals:
+            print(f"{col} percentiles: " +
+                  "  ".join(f"p{p}={v:.3f}" for p, v in _pct(vals).items()))
     _ascii_hist(F)
     _ascii_hist(Fe, label="ease_entropy")
 

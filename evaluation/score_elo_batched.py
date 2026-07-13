@@ -40,9 +40,14 @@ the torch / arena / score_elo pieces.
 
 import math
 import numpy as np
+import os
+import glob
+import re
+import csv
 
 from engine.gameEnv import Chess
-from model.encoding import encode
+from model.encoding import encode_env
+from search.puct import node_fpu_q
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
 
 
@@ -132,6 +137,7 @@ class _AGame:
 # core batched runner
 # --------------------------------------------------------------------------- #
 def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
+                            fpu_reduction=0.25,
                             opening_plies=8, opening_temp=1.0, max_plies=160,
                             concurrency=128, use_cache=True, cache_cap=250_000,
                             on_game_done=None):
@@ -216,9 +222,10 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                 sqrt_pv = math.sqrt(node.visits)
                 best = None
                 best_score = -1e30
+                fpu_q = node_fpu_q(node, fpu_reduction)
                 for ch in node.children:
                     v = ch.visits
-                    q = ch.value / v if v else 0.0
+                    q = ch.value / v if v else fpu_q
                     s = q + c * ch.prior * sqrt_pv / (1 + v)
                     if s > best_score:
                         best_score = s
@@ -247,7 +254,10 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
 
             mover = env.board.sideToMove
             if cache is not None:
-                key = (g.search_net, env.board.stateKey())
+                # net inputs include the halfmove clock / repetition count now,
+                # so the cache key must too (see self_play_batched)
+                key = (g.search_net, env.board.stateKey(),
+                       env.halfmove_clock, env.counts.get(env.board.stateKey(), 1))
                 hit = cache.get(key)
                 if hit is not None:
                     priors, value = hit
@@ -261,7 +271,7 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
 
         # ---- one batched forward per distinct searching net ----
         for net_id, items in batches.items():
-            planes = [encode(it[2].board) for it in items]
+            planes = [encode_env(it[2]) for it in items]
             logits_b, values_b = eval_fns[net_id](planes)
             for (g, node, env, legal, path, mover), logits, value in zip(
                     items, logits_b, values_b):
@@ -270,7 +280,8 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                 priors = {m: float(p) for m, p in zip(legal, probs)}
                 value = float(value)
                 if cache is not None and len(cache) < cache_cap:
-                    cache[(net_id, env.board.stateKey())] = (priors, value)
+                    cache[(net_id, env.board.stateKey(), env.halfmove_clock,
+                           env.counts.get(env.board.stateKey(), 1))] = (priors, value)
                 _expand(node, priors, mover)
                 _backprop(path, value if mover == "white" else -value)
                 g.sims_done += 1
@@ -446,6 +457,81 @@ def _chunk(seq, n):
         i += size
     return [c for c in out if c]
 
+# --------------------------------------------------------------------------- #
+# checkpoint discovery
+# --------------------------------------------------------------------------- #
+def discover_checkpoints(ckpt_dir):
+    out = []
+    for p in glob.glob(os.path.join(ckpt_dir, "net_iter*.pt")):
+        m = re.search(r"net_iter(\d+)\.pt$", os.path.basename(p))
+        if m:
+            out.append((int(m.group(1)), p))
+    return sorted(out)            # [(iteration, path), ...] ascending
+
+
+# --------------------------------------------------------------------------- #
+# Elo fit  (Bradley-Terry MM, ties as half-wins, light prior, random pinned 0)
+# --------------------------------------------------------------------------- #
+def fit_elo(names, results, pin="random", prior_games=2.0, steps=400):
+    """
+    names    : list of player names (index = player id)
+    results  : list of (i, j, score_i, n)  -- score_i = i's points over n games
+    Returns  : dict name -> Elo, with `pin` at 0.
+    """
+    P = len(names)
+    gamma = [1.0] * P                      # BT strengths; Elo = 400*log10(gamma)
+    wins = [0.0] * P                       # total points (wins + 0.5*draws)
+    pairs = {}                             # i -> list of (j, n)
+    for i in range(P):
+        pairs[i] = []
+    for (i, j, s_i, n) in results:
+        wins[i] += s_i
+        wins[j] += (n - s_i)
+        pairs[i].append((j, n))
+        pairs[j].append((i, n))
+
+    # MM iterations: gamma_i = (W_i + prior/2) / ( sum_j n_ij/(gamma_i+gamma_j) + prior/(gamma_i+1) )
+    for _ in range(steps):
+        new = list(gamma)
+        for i in range(P):
+            denom = prior_games / (gamma[i] + 1.0)        # virtual draws vs rating 0
+            for (j, n) in pairs[i]:
+                denom += n / (gamma[i] + gamma[j])
+            if denom > 0:
+                new[i] = (wins[i] + 0.5 * prior_games) / denom
+        gamma = new
+
+    pin_idx = names.index(pin) if pin in names else 0
+    ref = gamma[pin_idx]
+    elo = {}
+    for i, name in enumerate(names):
+        elo[name] = 400.0 * math.log10(gamma[i] / ref) if gamma[i] > 0 else float("-inf")
+    return elo
+
+
+# --------------------------------------------------------------------------- #
+# match cache (resumable)
+# --------------------------------------------------------------------------- #
+def load_cache(path):
+    cache = {}
+    if not os.path.exists(path):
+        return cache
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            key = (row["a"], row["b"])
+            cache[key] = (int(row["a_wins"]), int(row["draws"]),
+                          int(row["b_wins"]), int(row["games"]))
+    return cache
+
+
+def append_cache(path, a, b, wins, draws, losses, games):
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["a", "b", "a_wins", "draws", "b_wins", "games"])
+        w.writerow([a, b, wins, draws, losses, games])
+
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -462,9 +548,7 @@ def main():
     import torch
 
     from evaluation.arena import RandomAgent, MaterialAgent, load_net
-    from evaluation.score_elo import (
-        discover_checkpoints, fit_elo, load_cache, append_cache,
-    )
+
     from model.network import ChessNet
 
     ap = argparse.ArgumentParser(description="Single/multi-process batched checkpoint Elo scoring")
@@ -660,3 +744,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
