@@ -25,7 +25,14 @@ CONFIG = dict(
     num_blocks=8,
 
     # outer loop
-    loop_iterations=800,        # self-play/train cycles
+    loop_iterations=4800,        # WAS 2400 (completed). Extending the horizon
+                                 # doubles as a warm restart: cosine_lr is a
+                                 # pure function of (it, total), so resuming at
+                                 # it=2401 with total=4800 lands at lr ~5.5e-4
+                                 # -- lifted off the 1e-4 floor it ground at
+                                 # since ~iter 2300 -- and re-decays to lr_min
+                                 # by 4800. The ~iter-870 resume showed exactly
+                                 # this pattern preceding renewed Elo growth.
 
     # self-play
     games_per_iter=192,
@@ -93,30 +100,66 @@ CONFIG = dict(
                                # storage keeps this at ~3 GB (dense would be
                                # ~14 GB): planes ~4.9 KB/row + ~40-entry
                                # (idx, prob) pairs instead of 4672 floats.
-    train_batches=100,
+    train_batches=64,          # WAS 100. consumed/iter = batches*batch_size;
+                               # at 100 the measured replay ratio pinned at
+                               # ~8 consumptions per position and rolling
+                               # value loss crept from ~0.16 (iter ~900) to
+                               # ~0.216 (iter 2400) while policy loss kept
+                               # falling -- the value-overfit signature. 64
+                               # brings replay to ~5 at the same data rate;
+                               # doubly important now that the LR restart
+                               # lifts lr ~5.5x. If value loss still creeps,
+                               # raise games_per_iter before cutting further.
     batch_size=256,
     lr=1e-3,
     lr_min=1e-4,                # cosine-decay floor; LR goes lr -> lr_min over the run
     weight_decay=1e-4,
-    ease_lr=1e-3,               # ease head's OWN optimiser, cosine-decayed
-    ease_lr_min=3e-4,           # ... to this floor over the run (a constant
+    forgiveness_lr=1e-3,               # forgiveness head's OWN optimiser, cosine-decayed
+    forgiveness_lr_min=3e-4,           # ... to this floor over the run (a constant
                                 # 1e-3 left the head jittering around its
                                 # noise floor late in training)
-    ease_loss_weight=0.5,       # weight of the ease-head loss in the total.
+    forgiveness_loss_weight=0.5,       # weight of the forgiveness-head loss in the total.
 
-    # ---- ease TARGET generation (now explicit; previously these silently
+    # ---- forgiveness TARGET generation (now explicit; previously these silently
     # used the defaults inside self_play_batched, so a calibrated tau never
     # reached the actors in the async runner) ----
-    ease_targets=True,
-    ease_tau=0.0313,            # probe_ease calibration: median(gap)/ln 2.
+    forgiveness_targets=True,  # STRENGTH PUSH: off. Forgiveness labels cost
+                                # forgiveness_extra_sims per full move (+~12%)
+                                # and, with the forced floor below, divert
+                                # ~half the root budget into equalising the
+                                # top-m children instead of deepening the PV.
+                                # The head's weights stay in the net untouched
+                                # (train_epoch skips the aux path; metrics log
+                                # zeros in the forgiveness columns). Labels for
+                                # head training are generated OFFLINE from any
+                                # checkpoint via train_forgiveness_heads.py --
+                                # nothing about this run consumes them, so
+                                # paying for them per-iteration buys nothing.
+    forgiveness_tau=0.044,             # probe_forgiveness calibration: median(gap)/ln 2.
+                                # Recalibrated 2026-07 from a 300-position
+                                # probe of the iter800 (128x8, FPU) net:
+                                # median gap 0.0303 -> tau 0.0437 (the old
+                                # 0.0313 squashed 37% of targets below F=0.1).
+                                # The same tau serves the entropy statistic.
                                 # FIX for the whole run -- changing it mid-run
                                 # rescales the head's targets under its feet.
-    ease_target_mode="gap",
-    ease_gamma=0.85,            # only used by mode="tree"
-    ease_extra_sims=100,        # extra full-move sims for ease (was 300; the
+    forgiveness_target_mode="flat_entropy",
+                                # visit-weighted normalised Q-entropy over the
+                                # whole search subtree (flat_forgiveness with
+                                # stat="entropy"). WAS "gap" (root-local action
+                                # gap). Compound "agg_stat" strings are parsed
+                                # by search.forgiveness.forgiveness_target; other options:
+                                # gap | entropy | tree_gap | tree_entropy |
+                                # flat_gap. NOTE: head targets change meaning
+                                # AND scale vs gap-mode runs -- forgiveness_R2 /
+                                # forgiveness_tvar are not comparable across the
+                                # switch, and the head re-fits over a few
+                                # iterations after a resume.
+    forgiveness_gamma=0.85,            # only used by mode="tree"
+    forgiveness_extra_sims=100,        # extra full-move sims for forgiveness (was 300; the
                                 # deep-not-wide floor below needs less width,
                                 # clawing back most of the +65% self-play cost)
-    ease_force_m=6,             # forced root children for ease Qs (was 12)
+    forgiveness_force_m=6,             # forced root children for forgiveness Qs (was 12)
     # ---- sample-efficiency / search levers (all new; see
     # training/self_play_batched.run_selfplay for the full rationale) ----
     fpu_reduction=0.25,         # first-play urgency: unvisited children assume
@@ -130,29 +173,38 @@ CONFIG = dict(
                                 # variance cut available in a data-starved run.
                                 # 1.0 = legacy pure-outcome labels.
     record_fast_rows=True,      # record playout-capped (fast) plies as
-                                # VALUE-ONLY rows (empty policy, ease mask 0):
+                                # VALUE-ONLY rows (empty policy, forgiveness mask 0):
                                 # ~4x value-head data for one encode() per ply.
                                 # The policy loss is mask-normalized in
                                 # training/train.py so policy gradients are NOT
                                 # diluted by these rows.
 
-    root_force_m=6,             # forced children on plain full moves
+    root_force_m=0,             # WAS 6. With forgiveness_targets=False this
+                                # restores plain PUCT roots (the documented
+                                # combination in self_play_batched): the full
+                                # 700 sims follow PUCT instead of ~400 of them
+                                # being pinned to a per-child floor. Forced
+                                # visits were already pruned from policy
+                                # targets, so the floor's only remaining
+                                # effect was weaker move selection + noisier
+                                # root values. Restore 6 when forgiveness
+                                # label generation is switched back on.
     root_force_visits=80,       # per-child visit floor CEILING. Effective
                                 # floor = min(this, cap // (2*m)) with
-                                # cap = search_iterations + ease_extra_sims:
+                                # cap = search_iterations + forgiveness_extra_sims:
                                 # min(80, 800//12) = 66 visits/child. Same
                                 # forced budget as before (6x66 ~ 12x40) but
                                 # ~40% less Q-gap noise variance -- the gap
                                 # statistic only needs the top-2 Qs solid.
-                                # Watch the new ease_R2 metrics column: ~0
+                                # Watch the new forgiveness_R2 metrics column: ~0
                                 # means the labels are still noise-dominated
-                                # at this tau/floor; raise ease_extra_sims
+                                # at this tau/floor; raise forgiveness_extra_sims
                                 # (960 lifts the floor to the full 80) before
                                 # blaming the head.
 
     # io
     checkpoint_dir="checkpoints",
-    checkpoint_every=5,
+    checkpoint_every=15,
     metrics_file="metrics.csv",
     resume=True,                # auto-load latest.pt at startup if present
 )
@@ -160,7 +212,7 @@ CONFIG = dict(
 
 def open_metrics(path, header):
     """Append-open a metrics CSV, writing `header` if the file is new. If the
-    file exists with a DIFFERENT header (schema change, e.g. the new ease_R2
+    file exists with a DIFFERENT header (schema change, e.g. the new forgiveness_R2
     columns), divert to <name>_v2.csv rather than appending misaligned rows.
     Returns (file, csv_writer, actual_path)."""
     if os.path.exists(path):
@@ -210,16 +262,16 @@ def main(cfg=CONFIG):
     # keeps the kernel fusion benefit without the cudagraph fragility.
     net = torch.compile(net)
 
-    # DISJOINT optimisers: the main optimiser never contains the ease-head
+    # DISJOINT optimisers: the main optimiser never contains the forgiveness-head
     # parameters and vice versa, so the two gradient steps in train_epoch are
     # fully decoupled -- neither optimiser can ever move the other's params.
-    main_params = [p for n, p in net.named_parameters() if "ease_" not in n]
-    ease_params = [p for n, p in net.named_parameters() if "ease_" in n]
+    main_params = [p for n, p in net.named_parameters() if "forgiveness_" not in n]
+    forgiveness_params = [p for n, p in net.named_parameters() if "forgiveness_" in n]
     optimiser = torch.optim.Adam(
         main_params, lr=cfg["lr"], weight_decay=cfg["weight_decay"]
     )
-    ease_optimiser = torch.optim.Adam(
-        ease_params, lr=cfg.get("ease_lr", 1e-3),
+    forgiveness_optimiser = torch.optim.Adam(
+        forgiveness_params, lr=cfg.get("forgiveness_lr", 1e-3),
         weight_decay=cfg["weight_decay"]
     )
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
@@ -248,12 +300,12 @@ def main(cfg=CONFIG):
         if missing:
             print(f"  note: {len(missing)} params freshly initialised "
                   f"(e.g. {missing[0]}) -- expected when resuming a "
-                  f"pre-ease-head checkpoint; the backbone is loaded.")
+                  f"pre-forgiveness-head checkpoint; the backbone is loaded.")
         try:
             if "optim_state" in ckpt:
                 optimiser.load_state_dict(ckpt["optim_state"])
-            if "ease_optim_state" in ckpt:
-                ease_optimiser.load_state_dict(ckpt["ease_optim_state"])
+            if "forgiveness_optim_state" in ckpt:
+                forgiveness_optimiser.load_state_dict(ckpt["forgiveness_optim_state"])
         except Exception as e:
             print(f"  note: optimizer state incompatible with the split "
                   f"param groups ({e}); optimizers start fresh.")
@@ -276,8 +328,8 @@ def main(cfg=CONFIG):
     # If an existing file has a different (older) header, divert to a fresh
     # _v2 file instead of appending misaligned rows. ----
     header = ["iteration", "buffer_size",
-              "loss_total", "loss_policy", "loss_value", "loss_ease",
-              "ease_R2", "ease_tvar",
+              "loss_total", "loss_policy", "loss_value", "loss_forgiveness",
+              "forgiveness_R2", "forgiveness_tvar",
               "selfplay_sec", "train_sec"]
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
     metrics_f, writer, metrics_path = open_metrics(metrics_path, header)
@@ -290,11 +342,11 @@ def main(cfg=CONFIG):
         lr = cosine_lr(it, cfg["lr"], cfg["lr_min"], cfg["loop_iterations"])
         for grp in optimiser.param_groups:
             grp["lr"] = lr
-        ease_lr = cosine_lr(it, cfg["ease_lr"], cfg.get("ease_lr_min", cfg["ease_lr"]),
+        forgiveness_lr = cosine_lr(it, cfg["forgiveness_lr"], cfg.get("forgiveness_lr_min", cfg["forgiveness_lr"]),
                             cfg["loop_iterations"])
-        for grp in ease_optimiser.param_groups:
-            grp["lr"] = ease_lr
-        print(f"  lr {lr:.2e}  ease_lr {ease_lr:.2e}")
+        for grp in forgiveness_optimiser.param_groups:
+            grp["lr"] = forgiveness_lr
+        print(f"  lr {lr:.2e}  forgiveness_lr {forgiveness_lr:.2e}")
 
         print("self play")
         t0 = time.time()
@@ -313,11 +365,11 @@ def main(cfg=CONFIG):
             fast_iterations=cfg["fast_search_iterations"],
             root_force_m=cfg["root_force_m"],
             root_force_visits=cfg["root_force_visits"],
-            ease_targets=cfg["ease_targets"], ease_tau=cfg["ease_tau"],
-            ease_target_mode=cfg["ease_target_mode"],
-            ease_gamma=cfg["ease_gamma"],
-            ease_extra_sims=cfg["ease_extra_sims"],
-            ease_force_m=cfg["ease_force_m"],
+            forgiveness_targets=cfg["forgiveness_targets"], forgiveness_tau=cfg["forgiveness_tau"],
+            forgiveness_target_mode=cfg["forgiveness_target_mode"],
+            forgiveness_gamma=cfg["forgiveness_gamma"],
+            forgiveness_extra_sims=cfg["forgiveness_extra_sims"],
+            forgiveness_force_m=cfg["forgiveness_force_m"],
             fpu_reduction=cfg["fpu_reduction"],
             value_target_lambda=cfg["value_target_lambda"],
             record_fast_rows=cfg["record_fast_rows"],
@@ -332,24 +384,24 @@ def main(cfg=CONFIG):
             net, buffer, optimiser, device,
             batches=cfg["train_batches"],
             batch_size=cfg["batch_size"],
-            aux_ease=True,
-            ease_weight=cfg.get("ease_loss_weight", 0.5),
-            ease_optimiser=ease_optimiser,
+            aux_forgiveness=cfg["forgiveness_targets"],
+            forgiveness_weight=cfg.get("forgiveness_loss_weight", 0.5),
+            forgiveness_optimiser=forgiveness_optimiser,
             scaler=scaler,
         )
         train_sec = time.time() - t0
 
         print(f"  loss total={losses['total']:.4f}  policy={losses['policy']:.4f}  "
-              f"value={losses['value']:.4f}  ease={losses['ease']:.4f}  "
-              f"ease_R2={losses['ease_R2']:+.3f} (tvar {losses['ease_tvar']:.4f})  "
+              f"value={losses['value']:.4f}  forgiveness={losses['forgiveness']:.4f}  "
+              f"forgiveness_R2={losses['forgiveness_R2']:+.3f} (tvar {losses['forgiveness_tvar']:.4f})  "
               f"(train {train_sec:.1f}s)")
 
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
             f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
-            f"{losses['ease']:.6f}",
-            f"{losses['ease_R2']:.4f}", f"{losses['ease_tvar']:.5f}",
+            f"{losses['forgiveness']:.6f}",
+            f"{losses['forgiveness_R2']:.4f}", f"{losses['forgiveness_tvar']:.5f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",
         ])
         metrics_f.flush()
@@ -362,7 +414,7 @@ def main(cfg=CONFIG):
         save_net = getattr(net, "_orig_mod", net)
         ckpt = {"iteration": it, "model_state": save_net.state_dict(),
                 "optim_state": optimiser.state_dict(),
-                "ease_optim_state": ease_optimiser.state_dict(),
+                "forgiveness_optim_state": forgiveness_optimiser.state_dict(),
                 "config": cfg}
 
         # always overwrite "latest" so resuming is trivial

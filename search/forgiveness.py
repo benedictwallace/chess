@@ -1,9 +1,9 @@
 """
-Ease / forgiveness statistics over search trees -- the SINGLE source of truth.
+Forgiveness statistics over search trees -- the SINGLE source of truth.
 
 Both sides of the project import from here:
-  * training/self_play_batched.py  -> ease_target() for the ease-head labels;
-  * evaluation/probe_ease.py and play_checkpoint.py -> the same statistics for
+  * training/self_play_batched.py  -> forgiveness_target() for the forgiveness-head labels;
+  * evaluation/probe_forgiveness.py and play_checkpoint.py -> the same statistics for
     probing, calibration, and in-game display.
 
 This module is dependency-free (math + numpy) and duck-typed: any node with
@@ -64,7 +64,7 @@ LOCAL STATISTICS (both in [0, 1], higher = more forgiving):
              the same as 30 equally good out of 30 -- the measure asks "what
              fraction of the available choice is genuinely usable?", not
              "how many usable moves in absolute terms?". Keep exp(H) around
-             (ease_from_qs reports it as eff_actions) when the absolute
+             (forgiveness_from_qs reports it as eff_actions) when the absolute
              count is wanted. Under a forced-visit floor, n is pinned to the
              forced set, which keeps the denominator comparable across
              positions.
@@ -84,11 +84,11 @@ under a forced-visit floor) only children with visits >= floor qualify --
 matched-variance Qs -- falling back to the min_kids most-visited children if
 too few qualify; with floor == 0 (interior nodes / unforced trees) all visited
 children qualify. Fewer than min_kids usable children -> the statistic is
-undefined (None), which ease_target turns into a masked-out training row.
+undefined (None), which forgiveness_target turns into a masked-out training row.
 
 SETTING TAU: tau is the value-unit scale that decides how much cost counts as
 "brittle" -- rankings between positions do not depend on it, absolute F values
-and training-target contrast do. Calibrate it empirically: probe_ease prints
+and training-target contrast do. Calibrate it empirically: probe_forgiveness prints
 tau = median(gap) / ln 2, which maps the median position's gap to F = 0.5; the
 same tau serves the entropy statistic (it plays the identical near-optimality
 role in the softmax). Fix tau for a whole training run: changing it mid-run
@@ -204,18 +204,18 @@ def flat_forgiveness(root, tau, min_kids=2, stat="gap"):
 # --------------------------------------------------------------------------- #
 # scalar statistics from a Q vector (probe / display convenience)
 # --------------------------------------------------------------------------- #
-def ease_from_qs(qs, tau):
-    """Scalar ease statistics from a DESCENDING chooser-POV Q vector:
+def forgiveness_from_qs(qs, tau):
+    """Scalar forgiveness statistics from a DESCENDING chooser-POV Q vector:
       gap          Q1 - Q2
       F_gap        exp(-gap / tau), the action-gap forgiveness
       eff_actions  exp(H), the effective number of good moves (perplexity of
                    softmax(Q / tau))
-      ease_entropy H / log(n), the normalised Q-entropy forgiveness in [0,1]
+      forgiveness_entropy H / log(n), the normalised Q-entropy forgiveness in [0,1]
     A single-move position has zero choice: gap pinned to the maximum (2.0),
     one effective action, zero entropy."""
     if len(qs) < 2:
         return {"gap": 2.0, "F_gap": math.exp(-2.0 / tau),
-                "eff_actions": 1.0, "ease_entropy": 0.0}
+                "eff_actions": 1.0, "forgiveness_entropy": 0.0}
     q = np.asarray(qs, dtype=np.float64)
     gap = float(q[0] - q[1])
     p = _softmax(q / tau)
@@ -223,25 +223,35 @@ def ease_from_qs(qs, tau):
     return {"gap": gap,
             "F_gap": math.exp(-gap / tau),
             "eff_actions": math.exp(h),
-            "ease_entropy": h / math.log(len(q))}
+            "forgiveness_entropy": h / math.log(len(q))}
 
 
 # --------------------------------------------------------------------------- #
 # training target
 # --------------------------------------------------------------------------- #
-def ease_target(root, floor, tau, mode="gap", gamma=0.85, stat=None):
-    """(target, mask) pair, both np.float32, for training the ease head from
+def forgiveness_target(root, floor, tau, mode="gap", gamma=0.85, stat=None):
+    """(target, mask) pair, both np.float32, for training the forgiveness head from
     a finished root search. mask is 1.0 where the statistic was computable
-    and 0.0 otherwise (masked rows contribute nothing to the ease loss).
+    and 0.0 otherwise (masked rows contribute nothing to the forgiveness loss).
 
     mode: a LOCAL_STATS key ("gap" or "entropy") -> that local statistic at
     the root with the forced-visit floor; or "tree" / "flat" -> the
     corresponding aggregator, built on `stat` (default "gap") as its local
-    measure. Examples:
-        ease_target(root, floor, tau)                             # local gap
-        ease_target(root, floor, tau, mode="entropy")             # local entropy
-        ease_target(root, floor, tau, mode="tree", stat="entropy")# tree-of-entropy
+    measure. Compound strings "tree_gap" / "tree_entropy" / "flat_gap" /
+    "flat_entropy" select aggregator and statistic in one token, so the
+    combination is expressible through a single config value
+    (CONFIG["forgiveness_target_mode"]) with no extra plumbing. Examples:
+        forgiveness_target(root, floor, tau)                             # local gap
+        forgiveness_target(root, floor, tau, mode="entropy")             # local entropy
+        forgiveness_target(root, floor, tau, mode="tree", stat="entropy")# tree-of-entropy
+        forgiveness_target(root, floor, tau, mode="flat_entropy")        # same idea, flat
     """
+    if stat is None and "_" in mode:
+        agg, _, s = mode.partition("_")
+        if agg in ("tree", "flat") and s in LOCAL_STATS:
+            mode, stat = agg, s
+        else:
+            raise ValueError(f"unknown forgiveness target mode {mode!r}")
     if mode == "tree":
         f = tree_forgiveness(root, gamma, tau, stat=stat or "gap")
     elif mode == "flat":
@@ -251,3 +261,4 @@ def ease_target(root, floor, tau, mode="gap", gamma=0.85, stat=None):
     if f is None:
         return np.float32(0.0), np.float32(0.0)
     return np.float32(min(1.0, max(0.0, f))), np.float32(1.0)
+

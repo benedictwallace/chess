@@ -22,44 +22,44 @@ PUCT formula, the same value-sign / backprop convention, and the same
 early-adjudication and ply-cap handling as training.self_play.play_game.
 
 EXAMPLES (changed): each recorded row is now a 5-tuple
-    (planes, policy_target, value_target, ease_target, ease_mask)
-matching training.train's aux_ease path -- with policy_target stored SPARSE as
+    (planes, policy_target, value_target, forgiveness_target, forgiveness_mask)
+matching training.train's aux_forgiveness path -- with policy_target stored SPARSE as
 an (action_indices, probs) pair (an empty pair marks a value-only row from a
 playout-capped fast move; see record_fast_rows in run_selfplay). Value targets
-are blended lam*z + (1-lam)*Q_root (see value_target_lambda). ease_target is a search-derived
-forgiveness statistic of the ROOT position in [0, 1] (see below); ease_mask is
+are blended lam*z + (1-lam)*Q_root (see value_target_lambda). forgiveness_target is a search-derived
+forgiveness statistic of the ROOT position in [0, 1] (see below); forgiveness_mask is
 1.0 where the statistic was computable and 0.0 otherwise (masked rows still
-train policy/value, contribute nothing to the ease loss).
+train policy/value, contribute nothing to the forgiveness loss).
 
-EASE TARGETS (new): the ease head amortises a search statistic, so every
-recorded root computes one. Definition is configurable via ease_target_mode
-("gap" or "entropy" -- the two local forgiveness statistics of search/ease.py
+FORGIVENESS TARGETS (new): the forgiveness head amortises a search statistic, so every
+recorded root computes one. Definition is configurable via forgiveness_target_mode
+("gap" or "entropy" -- the two local forgiveness statistics of search/forgiveness.py
 -- or a recursive aggregate of either):
-  * "gap"  (default): F = exp(-(Q1 - Q2) / ease_tau) over the root children
+  * "gap"  (default): F = exp(-(Q1 - Q2) / forgiveness_tau) over the root children
     that met the forced-visit floor -- the local action-gap forgiveness.
   * "tree": the recursive formulation F(s) = (1-g) F_local + g * sum
-    N(a)/sum N * F(s_a) over the search tree (ease_gamma).
+    N(a)/sum N * F(s_a) over the search tree (forgiveness_gamma).
   * "flat": the subtree formulation, F_local of every subtree node weighted by
     its visit share.
-Set ease_tau from a probe_ease.py calibration of a comparable checkpoint.
-All ease statistics are imported from search/ease.py -- the SAME functions the
+Set forgiveness_tau from a probe_forgiveness.py calibration of a comparable checkpoint.
+All forgiveness statistics are imported from search/forgiveness.py -- the SAME functions the
 probe and the play GUI use, so head targets and displayed/probed values can
 never drift apart.
 
-MORE EXHAUSTIVE ROOT SEARCH FOR EASE (new): trustworthy ease targets need more
+MORE EXHAUSTIVE ROOT SEARCH FOR FORGIVENESS (new): trustworthy forgiveness targets need more
 balanced root Qs than move selection does, so on full-search moves the budget
-is extended by `ease_extra_sims` and the forced-visit floor is WIDENED to
-`ease_force_m` children (if larger than root_force_m). With the defaults, full
+is extended by `forgiveness_extra_sims` and the forced-visit floor is WIDENED to
+`forgiveness_force_m` children (if larger than root_force_m). With the defaults, full
 moves run 700+300 = 1000 sims with the top 12 prior moves floored -- Q1..Q12
 all carry matched standard errors. Because forced visits are PRUNED from the
-recorded policy target (see below), the wider floor sharpens the ease target
+recorded policy target (see below), the wider floor sharpens the forgiveness target
 WITHOUT blurring the policy target. Cost: full moves are `full_search_prob` of
 plies, so +300 sims on them is roughly +30% self-play compute at the default
-0.25. With ease_targets=False, rows are still 5-tuples but carry ease_mask=0.0
+0.25. With forgiveness_targets=False, rows are still 5-tuples but carry forgiveness_mask=0.0
 everywhere, so the training path never needs to branch on format.
 
 FORCED ROOT VISITS (Gumbel/KataGo-style): on full-search moves, the top
-`root_force_m` (or `ease_force_m`, whichever is larger when ease targets are
+`root_force_m` (or `forgiveness_force_m`, whichever is larger when forgiveness targets are
 on) root children BY PRIOR are each guaranteed a floor of visits before
 ordinary PUCT selection resumes. Plain PUCT starves everything but its
 favourite, which makes root Q values unusable for anything that compares
@@ -68,7 +68,7 @@ and fast (playout-capped) moves are never forced. Forced visits are SUBTRACTED
 from every non-best child when building the policy target and when sampling
 the move to play (KataGo's policy-target pruning), so training targets keep
 the sharpness of plain PUCT while the tree retains balanced Q statistics.
-Set root_force_m=0 AND ease_targets=False to restore plain PUCT roots.
+Set root_force_m=0 AND forgiveness_targets=False to restore plain PUCT roots.
 
 VALUE LABELS FOR PLY-CAP GAMES: a game that hits `max_plies` without a
 terminal result is scored by material adjudication first -- a lead of
@@ -96,7 +96,7 @@ import numpy as np
 from engine.gameEnv import Chess
 from model.encoding import encode, encode_env
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
-from search.ease import ease_target
+from search.forgiveness import forgiveness_target
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +226,7 @@ class _GameState:
         self.early_result = None
         self.sims_done = 0
         self.done = False
-        self.history = []   # (planes, sparse_policy, mover_sign, v_white, ease_t, ease_m)
+        self.history = []   # (planes, sparse_policy, mover_sign, v_white, forgiveness_t, forgiveness_m)
                             # sparse_policy = (idx, probs); EMPTY pair -> value-only row
         self.move_cap = 0         # per-move simulation budget (set by _begin_move)
         self.is_full_move = True  # full-search move? only these become training rows
@@ -248,8 +248,8 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  use_cache=True, cache_cap=200_000,
                  reuse_tree=True, full_search_prob=1.0, fast_iterations=None,
                  root_force_m=6, root_force_visits=80,
-                 ease_targets=True, ease_tau=0.0313, ease_target_mode="gap",
-                 ease_gamma=0.85, ease_extra_sims=100, ease_force_m=6,
+                 forgiveness_targets=True, forgiveness_tau=0.0313, forgiveness_target_mode="gap",
+                 forgiveness_gamma=0.85, forgiveness_extra_sims=100, forgiveness_force_m=6,
                  fpu_reduction=0.25, value_target_lambda=0.7,
                  record_fast_rows=True,
                  verbose=True):
@@ -262,18 +262,18 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         logits      : array-like [B, NUM_ACTIONS]   (mover-POV policy logits)
         values      : array-like [B]                (mover-POV value in [-1,1])
 
-    Returns a flat list of (planes, policy_target, value_target, ease_target,
-    ease_mask) examples -- the aux_ease format of training.train -- where
+    Returns a flat list of (planes, policy_target, value_target, forgiveness_target,
+    forgiveness_mask) examples -- the aux_forgiveness format of training.train -- where
     policy_target is SPARSE: an (action_indices, probs) pair. Rows with an
     EMPTY pair are value-only rows; training.train._collate gives them policy
-    weight 0 (value/ease train as normal).
+    weight 0 (value/forgiveness train as normal).
 
     VALUE-ONLY FAST ROWS (record_fast_rows, default on): playout-capped fast
     moves -- 1-full_search_prob of all plies -- previously emitted nothing,
     discarding ~75% of the game's positions. Their visit counts are useless as
     policy targets (tiny budget, no noise, no forcing) but the position is
     labelled by the SAME game outcome and its root value, so each is now
-    recorded as a value-only row (empty policy, ease_mask 0). ~4x value-head
+    recorded as a value-only row (empty policy, forgiveness_mask 0). ~4x value-head
     data at the cost of one encode() per fast ply. Size the replay buffer for
     the extra volume (rows/game grows ~4x).
 
@@ -296,30 +296,30 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     only full-budget moves are recorded and get root noise).
 
     Forced root visits: on full-search moves, each of the top
-    max(root_force_m, ease_force_m if ease_targets else 0) root children by
+    max(root_force_m, forgiveness_force_m if forgiveness_targets else 0) root children by
     prior is selected directly (bypassing PUCT) until it has
     min(root_force_visits, move_cap // (2*m)) visits. Equalises the top
-    actions' Q standard errors (prerequisite for gap/variance/ease statistics
+    actions' Q standard errors (prerequisite for gap/variance/forgiveness statistics
     and clean policy tails). Forced visits are pruned from non-best moves in
     the recorded policy target and the move-selection distribution, so targets
     keep PUCT's sharpness. Visits carried in by subtree reuse count toward the
     floor.
 
-    Ease targets: on full-search moves the budget is iterations +
-    ease_extra_sims and after the search an ease statistic of the root
-    (ease_target_mode: "gap" | "entropy" | "tree" | "flat"; temperature
-    ease_tau; "tree" decay ease_gamma) is recorded with mask 1.0. Rows where the statistic is
-    uncomputable, or all rows when ease_targets=False, carry mask 0.0 -- the
-    ease loss ignores them, policy/value train as normal.
+    Forgiveness targets: on full-search moves the budget is iterations +
+    forgiveness_extra_sims and after the search an forgiveness statistic of the root
+    (forgiveness_target_mode: "gap" | "entropy" | "tree" | "flat"; temperature
+    forgiveness_tau; "tree" decay forgiveness_gamma) is recorded with mask 1.0. Rows where the statistic is
+    uncomputable, or all rows when forgiveness_targets=False, carry mask 0.0 -- the
+    forgiveness loss ignores them, policy/value train as normal.
     """
     concurrency = max(1, min(concurrency, num_games))
     cache = {} if use_cache else None
 
-    full_cap = iterations + (int(ease_extra_sims) if ease_targets else 0)
+    full_cap = iterations + (int(forgiveness_extra_sims) if forgiveness_targets else 0)
     fast_cap = iterations if fast_iterations is None else max(1, int(fast_iterations))
     full_search_prob = min(1.0, max(0.0, full_search_prob))
     root_force_m = max(0, int(root_force_m))
-    full_force_m = max(root_force_m, int(ease_force_m)) if ease_targets \
+    full_force_m = max(root_force_m, int(forgiveness_force_m)) if forgiveness_targets \
         else root_force_m
     move_rng = np.random.default_rng()
 
@@ -347,13 +347,13 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     rwp = float(g.history[-1][3])
         out = []
         lam = value_target_lambda
-        for (planes, policy_t, mover_sign, v_white, ease_t, ease_m) in g.history:
+        for (planes, policy_t, mover_sign, v_white, forgiveness_t, forgiveness_m) in g.history:
             # blend the game outcome with the position's own search root value
             # (both converted to the recorded mover's POV). lam=1 -> pure z.
             z_mover = rwp * mover_sign
             q_mover = v_white * mover_sign
             target = lam * z_mover + (1.0 - lam) * q_mover
-            out.append((planes, policy_t, np.float32(target), ease_t, ease_m))
+            out.append((planes, policy_t, np.float32(target), forgiveness_t, forgiveness_m))
         finished += 1
         if verbose:
             print(f"  game {finished}/{num_games}: {len(out)} positions "
@@ -389,26 +389,26 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             return
         mover = env.board.sideToMove
         mover_sign = 1 if mover == "white" else -1
-        # Full-search moves carry a real policy target (+ ease when enabled).
+        # Full-search moves carry a real policy target (+ forgiveness when enabled).
         # Fast (playout-capped) moves are recorded as VALUE-ONLY rows when
         # record_fast_rows: empty policy (their tiny no-noise search is not a
-        # policy target), ease mask 0, but the position still trains the value
+        # policy target), forgiveness mask 0, but the position still trains the value
         # head on the blended outcome/root-value label.
         if g.is_full_move or record_fast_rows:
             planes = encode_env(env)
             v_white = _position_value_white(root, mover_sign)
             if g.is_full_move:
                 policy_target = _policy_target_sparse(visit_counts, mover)
-                if ease_targets:
-                    ease_t, ease_m = ease_target(root, g.force_n, ease_tau,
-                                                  ease_target_mode, ease_gamma)
+                if forgiveness_targets:
+                    forgiveness_t, forgiveness_m = forgiveness_target(root, g.force_n, forgiveness_tau,
+                                                  forgiveness_target_mode, forgiveness_gamma)
                 else:
-                    ease_t, ease_m = np.float32(0.0), np.float32(0.0)
+                    forgiveness_t, forgiveness_m = np.float32(0.0), np.float32(0.0)
             else:
                 policy_target = _EMPTY_POLICY
-                ease_t, ease_m = np.float32(0.0), np.float32(0.0)
+                forgiveness_t, forgiveness_m = np.float32(0.0), np.float32(0.0)
             g.history.append((planes, policy_target, mover_sign, v_white,
-                              ease_t, ease_m))
+                              forgiveness_t, forgiveness_m))
 
         temp = 1.0 if g.ply < temp_moves else 0.0
         move = select_move(visit_counts, temp)
@@ -435,7 +435,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
 
     def _begin_move(g):
         """Start a new move: pick its simulation budget (playout-cap
-        randomization; full moves carry the ease_extra_sims extension) and the
+        randomization; full moves carry the forgiveness_extra_sims extension) and the
         forced-visit configuration. sims_done starts at the (possibly reused)
         root's visit count so the budget counts what the tree already holds."""
         full = move_rng.random() < full_search_prob
@@ -634,29 +634,29 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            reuse_tree=True, full_search_prob=1.0,
                            fast_iterations=None,
                            root_force_m=6, root_force_visits=80,
-                           ease_targets=True, ease_tau=0.0313,
-                           ease_target_mode="gap", ease_gamma=0.85,
-                           ease_extra_sims=100, ease_force_m=6,
+                           forgiveness_targets=True, forgiveness_tau=0.0313,
+                           forgiveness_target_mode="gap", forgiveness_gamma=0.85,
+                           forgiveness_extra_sims=100, forgiveness_force_m=6,
                            fpu_reduction=0.25, value_target_lambda=0.7,
                            record_fast_rows=True,
                            verbose=True):
     """
     Drop-in replacement for generate_games_parallel. Returns a flat list of
-    (planes, policy_target, value_target, ease_target, ease_mask) examples --
-    train with train_epoch(..., aux_ease=True). `concurrency` is the number of
+    (planes, policy_target, value_target, forgiveness_target, forgiveness_mask) examples --
+    train with train_epoch(..., aux_forgiveness=True). `concurrency` is the number of
     games run/batched simultaneously (the main GPU batch-size lever).
 
     See run_selfplay for reuse_tree / playout-cap randomization, forced root
-    visits (root_force_m / root_force_visits) and the ease-target options
-    (ease_targets, ease_tau, ease_target_mode, ease_gamma, ease_extra_sims,
-    ease_force_m). Ease targets default ON with a "gap" statistic. Defaults
-    (probe_ease-calibrated tau=0.0313; DEEP-NOT-WIDE floor: 6 forced children,
+    visits (root_force_m / root_force_visits) and the forgiveness-target options
+    (forgiveness_targets, forgiveness_tau, forgiveness_target_mode, forgiveness_gamma, forgiveness_extra_sims,
+    forgiveness_force_m). Forgiveness targets default ON with a "gap" statistic. Defaults
+    (probe_forgiveness-calibrated tau=0.0313; DEEP-NOT-WIDE floor: 6 forced children,
     80-visit ceiling; +100-sim budget) follow the noise analysis: the gap
     statistic only needs the TOP-2 Qs to be trustworthy, so the forced budget
     buys more per sim as depth-per-child than as width. The effective floor is
-    min(root_force_visits, (iterations+ease_extra_sims) // (2*m)) -- with the
+    min(root_force_visits, (iterations+forgiveness_extra_sims) // (2*m)) -- with the
     defaults min(80, 800//12) = 66 visits/child. Judge label quality by the
-    ease_R2 column train_epoch now reports, not by the raw ease MSE.
+    forgiveness_R2 column train_epoch now reports, not by the raw forgiveness MSE.
     """
     if num_games <= 0:
         return []
@@ -670,10 +670,11 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         reuse_tree=reuse_tree, full_search_prob=full_search_prob,
         fast_iterations=fast_iterations,
         root_force_m=root_force_m, root_force_visits=root_force_visits,
-        ease_targets=ease_targets, ease_tau=ease_tau,
-        ease_target_mode=ease_target_mode, ease_gamma=ease_gamma,
-        ease_extra_sims=ease_extra_sims, ease_force_m=ease_force_m,
+        forgiveness_targets=forgiveness_targets, forgiveness_tau=forgiveness_tau,
+        forgiveness_target_mode=forgiveness_target_mode, forgiveness_gamma=forgiveness_gamma,
+        forgiveness_extra_sims=forgiveness_extra_sims, forgiveness_force_m=forgiveness_force_m,
         fpu_reduction=fpu_reduction, value_target_lambda=value_target_lambda,
         record_fast_rows=record_fast_rows,
         verbose=verbose,
     )
+

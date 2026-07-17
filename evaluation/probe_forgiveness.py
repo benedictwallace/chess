@@ -1,6 +1,6 @@
 """
-Ease/forgiveness probe: measure per-position ease statistics with a pretrained
-checkpoint, for calibration and visualization -- BEFORE committing an ease head
+Forgiveness probe: measure per-position forgiveness statistics with a pretrained
+checkpoint, for calibration and visualization -- BEFORE committing an forgiveness head
 or a search modification to any particular definition.
 
 What it does:
@@ -17,11 +17,11 @@ What it does:
   3. From each root's qualified children (visits >= floor) computes, chooser-POV,
      the TWO local forgiveness statistics (plus their recursive aggregates):
        q1, q2, gap = q1 - q2          the action gap
-       F_gap = exp(-gap / tau)        gap ease (tau auto-calibrated: median
+       F_gap = exp(-gap / tau)        gap forgiveness (tau auto-calibrated: median
                                       gap -> F = 0.5, unless --tau given)
        eff_actions = exp(H)           H = entropy of softmax(Q / tau) --
                                       "effective number of good moves"
-       ease_entropy                   H normalized to [0,1] by log(#qualified)
+       forgiveness_entropy                   H normalized to [0,1] by log(#qualified)
        F_tree_gap, F_flat_gap         the recursive / flat-subtree aggregates
        F_tree_entropy, F_flat_entropy of EACH local statistic ("tree" uses
                                       the --gamma decay; "flat" is implicit)
@@ -30,17 +30,17 @@ What it does:
      forgiving positions found.
   5. Optionally (--sims-hi N) re-searches every position at a larger budget and
      reports the Spearman rank correlation of the gaps across budgets -- the
-     "is my cheap-search ease a good proxy for expensive-search ease?" check
-     that decides whether ease-head targets can be harvested from ordinary
+     "is my cheap-search forgiveness a good proxy for expensive-search forgiveness?" check
+     that decides whether forgiveness-head targets can be harvested from ordinary
      self-play searches or need a dedicated high-budget labelling pass.
 
 Usage:
-    python probe_ease.py --checkpoint checkpoints/net_iter200.pt
-    python probe_ease.py --checkpoint ... --positions 500 --sims 700 --sims-hi 5000
-    python probe_ease.py --checkpoint ... --fens my_positions.txt --out probe.csv
+    python probe_forgiveness.py --checkpoint checkpoints/net_iter200.pt
+    python probe_forgiveness.py --checkpoint ... --positions 500 --sims 700 --sims-hi 5000
+    python probe_forgiveness.py --checkpoint ... --fens my_positions.txt --out probe.csv
 
 Visualization: the CSV has one row per position including its FEN. Sort by
-F_gap (or ease_entropy) and paste FENs into any board GUI / lichess analysis
+F_gap (or forgiveness_entropy) and paste FENs into any board GUI / lichess analysis
 to eyeball what the metric calls brittle vs forgiving; or plot the columns
 directly (gap vs ply, F_gap histogram, eff_actions vs v_root, ...).
 """
@@ -60,7 +60,7 @@ from evaluation.arena import load_net
 from training.self_play_batched import (
     Node, _expand, _backprop, _softmax,
 )
-from search.ease import ease_from_qs, tree_forgiveness, flat_forgiveness
+from search.forgiveness import forgiveness_from_qs, tree_forgiveness, flat_forgiveness
 
 try:
     from engine.fen import board_to_fen, env_from_fen, square_to_alg
@@ -316,7 +316,7 @@ def _ascii_hist(values, lo=0.0, hi=1.0, bins=20, width=40, label="F_gap"):
 # main
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description="Ease/forgiveness probe over "
+    ap = argparse.ArgumentParser(description="Forgiveness probe over "
                                              "positions with a checkpoint")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--positions", type=int, default=300,
@@ -346,7 +346,7 @@ def main():
     ap.add_argument("--max-ply", type=int, default=140)
     ap.add_argument("--harvest-temp", type=float, default=1.0,
                     help="softmax temperature for harvest move sampling")
-    ap.add_argument("--out", default="ease_probe.csv")
+    ap.add_argument("--out", default="forgiveness_probe.csv")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true",
                     help="run the net under fp16 autocast (faster, but "
@@ -412,7 +412,7 @@ def main():
 
     rows = []
     for it, st in results:
-        ease = ease_from_qs(st["qs"], tau)
+        forgiveness = forgiveness_from_qs(st["qs"], tau)
         # tree/flat statistics must be computed HERE, while it.root still holds
         # the low-budget tree (a --sims-hi re-search resets the roots).
         # Both recursive formulations, on BOTH local statistics:
@@ -427,10 +427,10 @@ def main():
             "v_root": round(st["v_root"], 4),
             "q1": round(st["qs"][0], 4),
             "q2": round(st["qs"][1], 4) if len(st["qs"]) > 1 else "",
-            "gap": round(ease["gap"], 4),
-            "F_gap": round(ease["F_gap"], 4),
-            "eff_actions": round(ease["eff_actions"], 3),
-            "ease_entropy": round(ease["ease_entropy"], 4),
+            "gap": round(forgiveness["gap"], 4),
+            "F_gap": round(forgiveness["F_gap"], 4),
+            "eff_actions": round(forgiveness["eff_actions"], 3),
+            "forgiveness_entropy": round(forgiveness["forgiveness_entropy"], 4),
             "F_tree_gap": round(f_tree_gap, 4) if f_tree_gap is not None else "",
             "F_flat_gap": round(f_flat_gap, 4) if f_flat_gap is not None else "",
             "F_tree_entropy": round(f_tree_ent, 4) if f_tree_ent is not None else "",
@@ -440,7 +440,7 @@ def main():
         })
 
     # ---- cross-statistic rank agreement: do the measures even disagree? ----
-    stat_cols = ["F_gap", "ease_entropy",
+    stat_cols = ["F_gap", "forgiveness_entropy",
                  "F_tree_gap", "F_flat_gap",
                  "F_tree_entropy", "F_flat_entropy"]
     complete = [r for r in rows if all(r[c] != "" for c in stat_cols)]
@@ -462,23 +462,23 @@ def main():
         for it, st in run_all(args.sims_hi, "hi-"):
             if st is not None and len(st["qs"]) > 1:
                 hi_gap[id(it)] = st["qs"][0] - st["qs"][1]
-                hi_ent[id(it)] = ease_from_qs(st["qs"], tau)["ease_entropy"]
+                hi_ent[id(it)] = forgiveness_from_qs(st["qs"], tau)["forgiveness_entropy"]
         lo, hi, lo_e, hi_e = [], [], [], []
         for (it, st), row in zip(results, rows):
             g = hi_gap.get(id(it))
             row["gap_hi"] = round(g, 4) if g is not None else ""
             if g is not None and len(st["qs"]) > 1:
                 lo.append(row["gap"]); hi.append(g)
-                lo_e.append(row["ease_entropy"]); hi_e.append(hi_ent[id(it)])
+                lo_e.append(row["forgiveness_entropy"]); hi_e.append(hi_ent[id(it)])
         rho = spearman(np.asarray(lo), np.asarray(hi))
         print(f"Spearman(gap @ {args.sims}, gap @ {args.sims_hi}) = {rho:.3f} "
               f"over {len(lo)} positions")
         if len(lo_e) > 10:
             rho_e = spearman(np.asarray(lo_e), np.asarray(hi_e))
-            print(f"Spearman(ease_entropy @ {args.sims}, @ {args.sims_hi}) = "
+            print(f"Spearman(forgiveness_entropy @ {args.sims}, @ {args.sims_hi}) = "
                   f"{rho_e:.3f} over {len(lo_e)} positions")
-        print("  >= ~0.8: cheap-search ease is a good rank proxy -- harvest "
-              "ease-head targets from ordinary self-play searches.")
+        print("  >= ~0.8: cheap-search forgiveness is a good rank proxy -- harvest "
+              "forgiveness-head targets from ordinary self-play searches.")
         print("  <  ~0.6: budget matters -- plan a dedicated high-budget "
               "labelling pass.")
 
@@ -494,8 +494,8 @@ def main():
     F = [r["F_gap"] for r in rows]
     print("F_gap percentiles: " +
           "  ".join(f"p{p}={v:.3f}" for p, v in _pct(F).items()))
-    Fe = [r["ease_entropy"] for r in rows]
-    print("ease_entropy percentiles: " +
+    Fe = [r["forgiveness_entropy"] for r in rows]
+    print("forgiveness_entropy percentiles: " +
           "  ".join(f"p{p}={v:.3f}" for p, v in _pct(Fe).items()))
     eff = [r["eff_actions"] for r in rows]
     print(f"effective actions exp(H): mean {np.mean(eff):.2f}, "
@@ -506,7 +506,7 @@ def main():
             print(f"{col} percentiles: " +
                   "  ".join(f"p{p}={v:.3f}" for p, v in _pct(vals).items()))
     _ascii_hist(F)
-    _ascii_hist(Fe, label="ease_entropy")
+    _ascii_hist(Fe, label="forgiveness_entropy")
 
     by_f = sorted(rows, key=lambda r: r["F_gap"])
     print("\nmost BRITTLE positions (low F_gap):")

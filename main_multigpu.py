@@ -170,11 +170,11 @@ def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 fast_iterations=cfg["fast_search_iterations"],
                 root_force_m=cfg["root_force_m"],
                 root_force_visits=cfg["root_force_visits"],
-                ease_targets=cfg["ease_targets"], ease_tau=cfg["ease_tau"],
-                ease_target_mode=cfg["ease_target_mode"],
-                ease_gamma=cfg["ease_gamma"],
-                ease_extra_sims=cfg["ease_extra_sims"],
-                ease_force_m=cfg["ease_force_m"],
+                forgiveness_targets=cfg["forgiveness_targets"], forgiveness_tau=cfg["forgiveness_tau"],
+                forgiveness_target_mode=cfg["forgiveness_target_mode"],
+                forgiveness_gamma=cfg["forgiveness_gamma"],
+                forgiveness_extra_sims=cfg["forgiveness_extra_sims"],
+                forgiveness_force_m=cfg["forgiveness_force_m"],
                 fpu_reduction=cfg["fpu_reduction"],
                 value_target_lambda=cfg["value_target_lambda"],
                 record_fast_rows=cfg["record_fast_rows"],
@@ -251,12 +251,12 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
 
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"]).to(learner_device)
     # disjoint optimisers -> fully decoupled gradient steps (see train_epoch)
-    main_params = [p for n, p in net.named_parameters() if "ease_" not in n]
-    ease_params = [p for n, p in net.named_parameters() if "ease_" in n]
+    main_params = [p for n, p in net.named_parameters() if "forgiveness_" not in n]
+    forgiveness_params = [p for n, p in net.named_parameters() if "forgiveness_" in n]
     optimiser = torch.optim.Adam(main_params, lr=cfg["lr"],
                                  weight_decay=cfg["weight_decay"])
-    ease_optimiser = torch.optim.Adam(ease_params,
-                                      lr=cfg.get("ease_lr", 1e-3),
+    forgiveness_optimiser = torch.optim.Adam(forgiveness_params,
+                                      lr=cfg.get("forgiveness_lr", 1e-3),
                                       weight_decay=cfg["weight_decay"])
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
     scaler = GradScaler("cuda", enabled=(learner_device.type == "cuda"))
@@ -279,12 +279,12 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
         if missing:
             print(f"  note: {len(missing)} params freshly initialised "
                   f"(e.g. {missing[0]}) -- expected when resuming a "
-                  f"pre-ease-head checkpoint; the backbone is loaded.")
+                  f"pre-forgiveness-head checkpoint; the backbone is loaded.")
         try:
             if "optim_state" in ck:
                 optimiser.load_state_dict(ck["optim_state"])
-            if "ease_optim_state" in ck:
-                ease_optimiser.load_state_dict(ck["ease_optim_state"])
+            if "forgiveness_optim_state" in ck:
+                forgiveness_optimiser.load_state_dict(ck["forgiveness_optim_state"])
         except Exception as e:
             print(f"  note: optimizer state incompatible with the split "
                   f"param groups ({e}); optimizers start fresh.")
@@ -296,9 +296,9 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     # metrics
     header = ["train_step", "iteration", "buffer", "consumed_total",
               "replay_ratio",
-              "loss_total", "loss_policy", "loss_value", "loss_ease",
-              "ease_R2", "ease_tvar",
-              "lr", "ease_lr", "wall_sec"]
+              "loss_total", "loss_policy", "loss_value", "loss_forgiveness",
+              "forgiveness_R2", "forgiveness_tvar",
+              "lr", "forgiveness_lr", "wall_sec"]
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
     mf, writer, metrics_path = open_metrics(metrics_path, header)
 
@@ -365,17 +365,17 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
             lr = cosine_lr(step + 1, cfg["lr"], cfg["lr_min"], total_train_steps)
             for grp in optimiser.param_groups:
                 grp["lr"] = lr
-            ease_lr = cosine_lr(step + 1, cfg["ease_lr"],
-                                cfg.get("ease_lr_min", cfg["ease_lr"]),
+            forgiveness_lr = cosine_lr(step + 1, cfg["forgiveness_lr"],
+                                cfg.get("forgiveness_lr_min", cfg["forgiveness_lr"]),
                                 total_train_steps)
-            for grp in ease_optimiser.param_groups:
-                grp["lr"] = ease_lr
+            for grp in forgiveness_optimiser.param_groups:
+                grp["lr"] = forgiveness_lr
 
             losses = train_epoch(net, buffer, optimiser, learner_device,
                                  batches=train_block, batch_size=cfg["batch_size"],
-                                 aux_ease=True,
-                                 ease_weight=cfg.get("ease_loss_weight", 0.5),
-                                 ease_optimiser=ease_optimiser,
+                                 aux_forgiveness=cfg["forgiveness_targets"],
+                                 forgiveness_weight=cfg.get("forgiveness_loss_weight", 0.5),
+                                 forgiveness_optimiser=forgiveness_optimiser,
                                  scaler=scaler)
             step += train_block
 
@@ -388,16 +388,16 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                 writer.writerow([step, it, len(buffer), consumed_total,
                                  f"{ratio:.2f}",
                                  f"{losses['total']:.6f}", f"{losses['policy']:.6f}",
-                                 f"{losses['value']:.6f}", f"{losses['ease']:.6f}",
-                                 f"{losses['ease_R2']:.4f}", f"{losses['ease_tvar']:.5f}",
-                                 f"{lr:.3e}", f"{ease_lr:.3e}",
+                                 f"{losses['value']:.6f}", f"{losses['forgiveness']:.6f}",
+                                 f"{losses['forgiveness_R2']:.4f}", f"{losses['forgiveness_tvar']:.5f}",
+                                 f"{lr:.3e}", f"{forgiveness_lr:.3e}",
                                  f"{time.time()-t_start:.1f}"])
                 mf.flush()
                 print(f"  step {step}/{total_train_steps}  buf {len(buffer)}  "
                       f"consumed {consumed_total}  ratio {ratio:.1f}  "
                       f"loss {losses['total']:.4f} "
                       f"(p {losses['policy']:.3f} v {losses['value']:.3f} "
-                      f"e {losses['ease']:.3f} R2 {losses['ease_R2']:+.2f})  "
+                      f"e {losses['forgiveness']:.3f} R2 {losses['forgiveness_R2']:+.2f})  "
                       f"lr {lr:.2e}",
                       flush=True)
 
@@ -406,7 +406,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                 ckpt = {"iteration": it, "train_step": step,
                         "model_state": net.state_dict(),
                         "optim_state": optimiser.state_dict(),
-                        "ease_optim_state": ease_optimiser.state_dict(),
+                        "forgiveness_optim_state": forgiveness_optimiser.state_dict(),
                         "config": cfg}
                 _atomic_torch_save(ckpt, latest)
                 _atomic_torch_save(ckpt, os.path.join(cfg["checkpoint_dir"],
@@ -426,7 +426,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
         ckpt = {"iteration": it, "train_step": step,
                 "model_state": net.state_dict(),
                 "optim_state": optimiser.state_dict(),
-                "ease_optim_state": ease_optimiser.state_dict(),
+                "forgiveness_optim_state": forgiveness_optimiser.state_dict(),
                 "config": cfg}
         _atomic_torch_save(ckpt, latest)
         _atomic_torch_save(ckpt, os.path.join(cfg["checkpoint_dir"], f"net_iter{it}.pt"))
@@ -474,3 +474,5 @@ if __name__ == "__main__":
          train_block=args.train_block, games_per_chunk=args.games_per_chunk,
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
+    
+    

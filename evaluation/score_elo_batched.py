@@ -140,7 +140,7 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                             fpu_reduction=0.25,
                             opening_plies=8, opening_temp=1.0, max_plies=160,
                             concurrency=128, use_cache=True, cache_cap=250_000,
-                            on_game_done=None):
+                            on_game_done=None, decide_move=None):
     """
     tickets : list of (pidx, a_is_white, white_mover, black_mover)
               white_mover/black_mover is a net_id str (neural) or an anchor agent.
@@ -148,6 +148,11 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
               mover-POV policy logits and mover-POV value in [-1, 1].
     on_game_done(pidx, a_score) is called as each game finishes (for resumable
               caching / progress).
+    decide_move(g, visit_counts) -> move, optional: overrides the default
+              move choice (opening temp then argmax-by-visits). g exposes
+              .search_net (the mover's net_id), .env, .ply, .root -- enough for
+              perturbed / forgiveness-aware selection. The callback owns ALL
+              temperature handling, including the opening.
 
     Returns list of (pidx, a_score) for every ticket (a_score in {0.0,0.5,1.0}).
     """
@@ -296,8 +301,11 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
             if not visit_counts:
                 finalize(g)
             else:
-                temp = opening_temp if g.ply < opening_plies else 0.0
-                move = select_move(visit_counts, temp)
+                if decide_move is not None:
+                    move = decide_move(g, visit_counts)
+                else:
+                    temp = opening_temp if g.ply < opening_plies else 0.0
+                    move = select_move(visit_counts, temp)
                 g.env.step(move)
                 g.ply += 1
                 if g.env.isTerminal() or g.ply >= max_plies:
@@ -744,4 +752,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
