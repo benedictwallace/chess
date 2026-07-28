@@ -98,6 +98,7 @@ from engine.gameEnv import Chess
 from model.encoding import encode, encode_env
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
 from search.forgiveness import forgiveness_target
+from search.puct import select_move_gumbel   # torch-free to import
 
 
 # --------------------------------------------------------------------------- #
@@ -239,11 +240,27 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  forgiveness_gamma=0.85, forgiveness_extra_sims=100, forgiveness_force_m=6,
                  fpu_reduction=0.25, value_target_lambda=0.7,
                  record_fast_rows=True,
+                 gumbel_select=False, gumbel_c_visit=50.0, gumbel_c_scale=1.0,
                  seed=None,
                  verbose=True):
     """
     Play `num_games` games, keeping up to `concurrency` of them running at once
     and batching their leaf evaluations.
+
+    GUMBEL MOVE SELECTION (gumbel_select, default off): on FULL-SEARCH moves,
+    pick the move played by argmax of the Gumbel-AlphaZero score
+        log prior + (gumbel_c_visit + max_visits) * gumbel_c_scale * Q
+    over the root children that met the forced-visit floor (see
+    search.puct.select_move_gumbel), instead of argmax pruned visits; during
+    the temp_moves opening the same scores are SAMPLED at the usual
+    temperature. This decides on prior-regularised Q values -- a late Q-flip
+    the visit counts have not caught up with gets played -- and it is sound
+    here precisely because the forced floor gives the candidates
+    matched-variance Qs. Fast (playout-capped) moves have no floor and junk
+    Qs, so they keep visit-based selection regardless. POLICY TARGETS ARE
+    UNCHANGED (still pruned visit counts): this flag changes which move is
+    played, not what is recorded. If fewer than two children met the floor
+    (e.g. root_force_m=0), selection falls back to pruned-visit selection.
 
     seed: seeds ONE np.random.Generator that drives every random draw in this
     call (playout-cap coin flips, Dirichlet noise, temperature sampling), so a
@@ -417,7 +434,16 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                               forgiveness_t, forgiveness_m))
 
         temp = 1.0 if g.ply < temp_moves else 0.0
-        move = select_move(visit_counts, temp, rng)
+        if gumbel_select and g.is_full_move and g.force_n > 0:
+            # Gumbel-AZ selection: logits + sigma(Q) over the floored
+            # candidates; pruned visit counts remain the FALLBACK (and the
+            # policy target, untouched above).
+            move = select_move_gumbel(
+                root, temp=temp, rng=rng,
+                c_visit=gumbel_c_visit, c_scale=gumbel_c_scale,
+                min_visits=g.force_n, fallback_counts=visit_counts)
+        else:
+            move = select_move(visit_counts, temp, rng)
         for ch in root.children:           # remember picked child -> subtree reuse
             if ch.move == move:
                 g.chosen = ch
@@ -645,6 +671,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            forgiveness_extra_sims=100, forgiveness_force_m=6,
                            fpu_reduction=0.25, value_target_lambda=0.7,
                            record_fast_rows=True,
+                           gumbel_select=False, gumbel_c_visit=50.0,
+                           gumbel_c_scale=1.0,
                            seed=None,
                            verbose=True):
     """
@@ -682,6 +710,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         forgiveness_extra_sims=forgiveness_extra_sims, forgiveness_force_m=forgiveness_force_m,
         fpu_reduction=fpu_reduction, value_target_lambda=value_target_lambda,
         record_fast_rows=record_fast_rows,
+        gumbel_select=gumbel_select, gumbel_c_visit=gumbel_c_visit,
+        gumbel_c_scale=gumbel_c_scale,
         seed=seed,
         verbose=verbose,
     )

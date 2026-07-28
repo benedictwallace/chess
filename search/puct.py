@@ -198,3 +198,103 @@ def select_move(visit_counts, temp=1.0, rng=None):
         rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
 
+
+# --------------------------------------------------------------------------- #
+# Gumbel-AlphaZero root move selection:  argmax  logits + sigma(q_hat)
+# (Danihelka et al. 2022, "Policy Improvement by Planning with Gumbel")
+# --------------------------------------------------------------------------- #
+def gumbel_scores(root, c_visit=50.0, c_scale=1.0, min_visits=1,
+                  include_unvisited=False):
+    """Per-child Gumbel selection scores at a finished root:
+
+        score(a) = log prior(a) + (c_visit + max_b N(b)) * c_scale * q_hat(a)
+
+    log prior(a) is the policy logit up to a softmax-invariant constant (the
+    root stores renormalised priors, possibly post-Dirichlet -- the shift
+    cancels inside any argmax/softmax over these scores). q_hat(a) is the
+    chooser-POV search Q, value/visits. The (c_visit + max_N) factor is the
+    paper's monotone transform sigma: with a small search the prior dominates,
+    with a large one the Qs do -- visit counts appear ONLY as this trust
+    scale, never as the selection statistic.
+
+    CANDIDATES: only children with visits >= min_visits are scored. The
+    paper's guarantee assumes candidate Qs of comparable variance (its
+    sequential halving arranges that; our forced-root-visit floor is the
+    analogue), and sigma multiplies Q noise by hundreds in logit space, so a
+    lucky 2-visit Q must not compete with a 400-visit one. Pass the forced
+    floor as min_visits on forced roots; on unforced roots pick a small guard
+    (callers here use ~budget/100).
+
+    include_unvisited=True additionally scores every below-floor child with a
+    COMPLETED Q -- the visit-weighted chooser-POV root value, this module's
+    stand-in for the paper's v_mix interpolation. That makes softmax(scores)
+    the paper's improved policy pi' over ALL actions (useful as a policy
+    target); for move selection leave it False, a completed Q is a
+    placeholder, not evidence the move is good.
+
+    Returns {Move: score}; empty if the root has no visited children.
+    Duck-typed: any node with .children / .visits / .value / .prior / .move.
+    """
+    kids = root.children
+    if not kids:
+        return {}
+    max_n = max(ch.visits for ch in kids)
+    if max_n == 0:
+        return {}
+    scale = (c_visit + max_n) * c_scale
+    floor = max(1, int(min_visits))
+    v_mix = None
+    if include_unvisited:
+        nsum = sum(ch.visits for ch in kids)
+        v_mix = sum(ch.value for ch in kids) / nsum   # chooser-POV root value
+    scores = {}
+    for ch in kids:
+        if ch.visits >= floor:
+            q = ch.value / ch.visits
+        elif include_unvisited:
+            q = v_mix
+        else:
+            continue
+        scores[ch.move] = math.log(max(ch.prior, 1e-12)) + scale * q
+    return scores
+
+
+def select_move_gumbel(root, temp=0.0, rng=None, c_visit=50.0, c_scale=1.0,
+                       min_visits=1, include_unvisited=False,
+                       fallback_counts=None):
+    """Choose the root move by the Gumbel score logits + sigma(q_hat).
+
+    temp <= 0: argmax over the candidate scores (the paper's acting rule).
+    temp > 0 : sample from softmax(scores / temp) -- a tempered version of the
+    improved policy pi', the drop-in replacement for opening-phase
+    visit-temperature sampling.
+
+    If fewer than TWO children qualify (min_visits too high for this tree --
+    e.g. an unforced root that PUCT starved), there is nothing for the Q term
+    to compare, so selection falls back to `fallback_counts` via
+    select_move(visit_counts, temp) when given, else to the single qualifier /
+    most-visited child. rng: optional seeded Generator (reproducible runs).
+    """
+    scores = gumbel_scores(root, c_visit=c_visit, c_scale=c_scale,
+                           min_visits=min_visits,
+                           include_unvisited=include_unvisited)
+    if len(scores) < 2:
+        if fallback_counts:
+            return select_move(fallback_counts, temp, rng)
+        if scores:
+            return next(iter(scores))
+        visited = [ch for ch in root.children if ch.visits > 0]
+        return max(visited, key=lambda ch: ch.visits).move if visited else None
+
+    moves = list(scores.keys())
+    s = np.array([scores[m] for m in moves], dtype=np.float64)
+    if temp <= 1e-6:
+        return moves[int(s.argmax())]
+    s = s / temp
+    s -= s.max()
+    p = np.exp(s)
+    p /= p.sum()
+    if rng is None:
+        rng = np.random.default_rng()
+    return moves[rng.choice(len(moves), p=p)]
+

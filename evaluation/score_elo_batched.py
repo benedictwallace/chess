@@ -47,7 +47,7 @@ import csv
 
 from engine.gameEnv import Chess
 from model.encoding import encode_env
-from search.puct import node_fpu_q
+from search.puct import node_fpu_q, select_move_gumbel
 from model.move_encoding import encodeMovePOV
 
 
@@ -135,7 +135,10 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                             fpu_reduction=0.25,
                             opening_plies=8, opening_temp=1.0, max_plies=160,
                             concurrency=128, use_cache=True, cache_cap=250_000,
-                            on_game_done=None, decide_move=None, rng=None):
+                            on_game_done=None, decide_move=None,
+                            gumbel_select=False, gumbel_c_visit=50.0,
+                            gumbel_c_scale=1.0, gumbel_min_visits=None,
+                            rng=None):
     """
     tickets : list of (pidx, a_is_white, white_mover, black_mover)
               white_mover/black_mover is a net_id str (neural) or an anchor agent.
@@ -148,6 +151,15 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
               .search_net (the mover's net_id), .env, .ply, .root -- enough for
               perturbed / forgiveness-aware selection. The callback owns ALL
               temperature handling, including the opening.
+    gumbel_select: replace the default POST-OPENING argmax-by-visits with
+              Gumbel-AlphaZero selection, argmax of
+                  log prior + (gumbel_c_visit + max_visits) * gumbel_c_scale * Q
+              over root children with visits >= gumbel_min_visits (default
+              max(1, iterations // 100) -- arena searches have NO forced
+              floor, so a guard keeps lucky low-visit Qs out of a score that
+              multiplies Q by hundreds in logit space; see
+              search.puct.select_move_gumbel). Opening plies keep the usual
+              visit-temperature sampling. Ignored when decide_move is given.
     rng     : optional seeded np.random.Generator for the default opening-
               temperature sampling (reproducible evaluation runs). Ignored
               when decide_move is given -- the callback owns its randomness.
@@ -301,6 +313,13 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
             else:
                 if decide_move is not None:
                     move = decide_move(g, visit_counts)
+                elif gumbel_select and g.ply >= opening_plies:
+                    move = select_move_gumbel(
+                        g.root, temp=0.0, rng=rng,
+                        c_visit=gumbel_c_visit, c_scale=gumbel_c_scale,
+                        min_visits=(gumbel_min_visits if gumbel_min_visits
+                                    else max(1, iterations // 100)),
+                        fallback_counts=visit_counts)
                 else:
                     temp = opening_temp if g.ply < opening_plies else 0.0
                     move = select_move(visit_counts, temp, rng)

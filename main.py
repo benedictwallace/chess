@@ -51,6 +51,18 @@ CONFIG = dict(
                                # also helps the data-starved async learner).
     temp_moves=20,
 
+    # Gumbel-AlphaZero move selection (see training/self_play_batched.py and
+    # search.puct.select_move_gumbel): on full-search moves, play the argmax of
+    #     log prior + (c_visit + max_visits) * c_scale * Q
+    # over the forced-floor candidates instead of argmax pruned visits
+    # (openings sample the same scores at temperature). Requires an active
+    # forced floor (root_force_m > 0 or forgiveness_targets=True) to have >= 2
+    # matched-variance candidates; otherwise it silently falls back to visit
+    # selection. Policy targets are unchanged. Default off = legacy behavior.
+    gumbel_select=False,
+    gumbel_c_visit=50.0,       # paper default; prior-vs-Q trust scale offset
+    gumbel_c_scale=1.0,        # paper default; overall sigma(Q) gain
+
     # self-play throughput (see training/self_play_batched.py):
     #  * subtree reuse: after a move, carry the chosen child's already-searched
     #    tree over as the next root instead of rebuilding it. On by default;
@@ -376,6 +388,9 @@ def main(cfg=CONFIG):
             fpu_reduction=cfg["fpu_reduction"],
             value_target_lambda=cfg["value_target_lambda"],
             record_fast_rows=cfg["record_fast_rows"],
+            gumbel_select=cfg["gumbel_select"],
+            gumbel_c_visit=cfg["gumbel_c_visit"],
+            gumbel_c_scale=cfg["gumbel_c_scale"],
         )
         selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
