@@ -8,7 +8,7 @@ import torch
 from model.move_encoding import encodeMove, decodeMove, NUM_ACTIONS
 from search.puct import search
 import os
-from training.self_play import generate_games
+from archive.self_play import generate_games
 from training.train import ReplayBuffer, train_epoch
 
 def testGPU():

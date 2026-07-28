@@ -79,8 +79,8 @@ DEFAULT_ANCHORS = [
     "sf:skill=5+nodes=800",
 ]
 
-MATCHES_FILE = "elo_matches_external.csv"
-RATINGS_FILE = "elo_ratings_external.csv"
+MATCHES_FILE = "checkpoints/elo_matches_external.csv"
+RATINGS_FILE = "checkpoints/elo_ratings_external.csv"
 
 
 def canon(spec: str) -> str:

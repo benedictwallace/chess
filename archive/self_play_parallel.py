@@ -6,7 +6,7 @@ import time
 import torch
 import numpy as np
 
-from training.self_play import play_game
+from archive.self_play import play_game
 
 
 class RemoteEvaluator:

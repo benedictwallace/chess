@@ -79,6 +79,26 @@ plug into either one for a recursive / subtree-level forgiveness):
                      over the downstream subtree including s; undefined nodes
                      skipped, weights renormalised. Depth decay is implicit.
 
+PARITY FILTERING -- whose forgiveness? Below any node the players alternate,
+so an unfiltered aggregate blends "how many good moves will the ROOT player
+have later" with "how many good moves will their OPPONENT have" -- two
+quantities a robustness objective plausibly treats with opposite signs (my
+slack is safety; their slack is their escape hatches). Both aggregators
+therefore take parity=None|0|1: None (default) keeps the unfiltered blend;
+0 accumulates local F only at EVEN depths below the node the aggregator is
+called on (that node's mover, plus the same player's later decision nodes);
+1 only at ODD depths (the opponent's decision nodes). Skipped levels are
+TRANSPARENT: they contribute no local term but pass their downstream
+aggregate through unchanged, so in tree_forgiveness gamma decays once per
+CONTRIBUTING level, not per ply. Parity is relative to the node you call on:
+at a search root, parity=0 is the recorded mover ("me"); calling on a root
+CHILD instead (e.g. forgiveness-aware move selection ranking a candidate
+move's subtree), the root player's decision nodes sit at parity=1 inside
+that subtree -- say which side you mean, don't assume. forgiveness_target
+exposes this through compound mode strings with a _me / _opp suffix
+("flat_entropy_me", "tree_gap_opp", ...), me/opp defined from the ROOT
+mover's point of view.
+
 QUALIFICATION (shared by both statistics): with floor > 0 (a root searched
 under a forced-visit floor) only children with visits >= floor qualify --
 matched-variance Qs; with floor == 0 (interior nodes / unforced trees) all
@@ -158,22 +178,34 @@ def node_local_F(node, tau, min_kids=2, floor=0, stat="gap"):
 # --------------------------------------------------------------------------- #
 # aggregators -- take EITHER local statistic via `stat`
 # --------------------------------------------------------------------------- #
-def tree_forgiveness(node, gamma, tau, min_kids=2, stat="gap"):
+def tree_forgiveness(node, gamma, tau, min_kids=2, stat="gap", parity=None,
+                     _depth=0):
     """Recursive visit-weighted forgiveness (formulation 1 of the project
     doc), built on the chosen local statistic. Summing over visited children
     only IS the formula (unvisited actions carry zero visit weight); children
     with undefined F are handled by renormalising the weights over the
     defined ones. Interior nodes are unforced, so the local statistic is
-    evaluated with floor=0 throughout. Returns None below unexpanded
-    leaves."""
+    evaluated with floor=0 throughout.
+
+    parity: None = every level's local F contributes (original behaviour);
+    0 / 1 = only even / odd depths below `node` contribute, other levels are
+    transparent pass-throughs (no local term, no extra gamma -- see the
+    module docstring's PARITY FILTERING section for the me/opp convention).
+
+    Returns None below unexpanded leaves (and, with parity, whenever no
+    qualifying level has a defined statistic)."""
     kids = [c for c in node.children if c.visits > 0]
     if not kids:
         return None
-    f_local = node_local_F(node, tau, min_kids, floor=0, stat=stat)
+    if parity is None or _depth % 2 == parity:
+        f_local = node_local_F(node, tau, min_kids, floor=0, stat=stat)
+    else:
+        f_local = None                    # skipped level: transparent
     tot = sum(c.visits for c in kids)
     acc = wsum = 0.0
     for c in kids:
-        f_c = tree_forgiveness(c, gamma, tau, min_kids, stat=stat)
+        f_c = tree_forgiveness(c, gamma, tau, min_kids, stat=stat,
+                               parity=parity, _depth=_depth + 1)
         if f_c is not None:
             w = c.visits / tot
             acc += w * f_c
@@ -184,16 +216,20 @@ def tree_forgiveness(node, gamma, tau, min_kids=2, stat="gap"):
     return f_local if f_local is not None else down
 
 
-def flat_forgiveness(root, tau, min_kids=2, stat="gap"):
+def flat_forgiveness(root, tau, min_kids=2, stat="gap", parity=None):
     """Flat subtree forgiveness (formulation 2 of the project doc), built on
     the chosen local statistic. Undefined-F nodes are skipped and the visit
-    weights renormalised over the rest."""
+    weights renormalised over the rest. parity: None = every node counts;
+    0 / 1 = only nodes at even / odd depths below `root` count (see the
+    module docstring's PARITY FILTERING section)."""
     acc = wsum = 0.0
-    stack = [root]
+    stack = [(root, 0)]
     while stack:
-        n = stack.pop()
+        n, depth = stack.pop()
         kids = [c for c in n.children if c.visits > 0]
-        stack.extend(kids)
+        stack.extend((c, depth + 1) for c in kids)
+        if parity is not None and depth % 2 != parity:
+            continue
         f = node_local_F(n, tau, min_kids, floor=0, stat=stat)
         if f is not None:
             acc += n.visits * f
@@ -229,7 +265,8 @@ def forgiveness_from_qs(qs, tau):
 # --------------------------------------------------------------------------- #
 # training target
 # --------------------------------------------------------------------------- #
-def forgiveness_target(root, floor, tau, mode="gap", gamma=0.85, stat=None):
+def forgiveness_target(root, floor, tau, mode="gap", gamma=0.85, stat=None,
+                       parity=None):
     """(target, mask) pair, both np.float32, for training the forgiveness head from
     a finished root search. mask is 1.0 where the statistic was computable
     and 0.0 otherwise (masked rows contribute nothing to the forgiveness loss).
@@ -240,23 +277,43 @@ def forgiveness_target(root, floor, tau, mode="gap", gamma=0.85, stat=None):
     measure. Compound strings "tree_gap" / "tree_entropy" / "flat_gap" /
     "flat_entropy" select aggregator and statistic in one token, so the
     combination is expressible through a single config value
-    (CONFIG["forgiveness_target_mode"]) with no extra plumbing. Examples:
+    (CONFIG["forgiveness_target_mode"]) with no extra plumbing.
+
+    A further _me / _opp suffix on the aggregated modes selects PARITY
+    FILTERING ("tree_gap_me", "flat_entropy_opp", ...; all eight
+    aggregator/statistic/parity combinations parse): _me keeps only the ROOT
+    MOVER's decision nodes (even depths -- the player whose planes the
+    training row records), _opp only the opponent's (odd depths). Keep the
+    two sides as SEPARATE label columns and combine them (e.g.
+    F_me - beta * F_opp) at consumption time, so beta stays a free knob that
+    costs no dataset regeneration. `parity` can also be passed explicitly
+    with mode="tree"/"flat". Examples:
         forgiveness_target(root, floor, tau)                             # local gap
         forgiveness_target(root, floor, tau, mode="entropy")             # local entropy
         forgiveness_target(root, floor, tau, mode="tree", stat="entropy")# tree-of-entropy
         forgiveness_target(root, floor, tau, mode="flat_entropy")        # same idea, flat
+        forgiveness_target(root, floor, tau, mode="flat_entropy_me")     # my nodes only
+        forgiveness_target(root, floor, tau, mode="tree_gap_opp")        # opponent's only
     """
     if stat is None and "_" in mode:
-        agg, _, s = mode.partition("_")
-        if agg in ("tree", "flat") and s in LOCAL_STATS:
-            mode, stat = agg, s
+        agg, _, rest = mode.partition("_")
+        p = parity
+        if rest.endswith("_me"):
+            rest, p = rest[:-3], 0
+        elif rest.endswith("_opp"):
+            rest, p = rest[:-4], 1
+        if agg in ("tree", "flat") and rest in LOCAL_STATS:
+            mode, stat, parity = agg, rest, p
         else:
             raise ValueError(f"unknown forgiveness target mode {mode!r}")
     if mode == "tree":
-        f = tree_forgiveness(root, gamma, tau, stat=stat or "gap")
+        f = tree_forgiveness(root, gamma, tau, stat=stat or "gap",
+                             parity=parity)
     elif mode == "flat":
-        f = flat_forgiveness(root, tau, stat=stat or "gap")
+        f = flat_forgiveness(root, tau, stat=stat or "gap", parity=parity)
     else:
+        if not callable(mode) and mode not in LOCAL_STATS:
+            raise ValueError(f"unknown forgiveness target mode {mode!r}")
         f = node_local_F(root, tau, floor=floor, stat=mode)
     if f is None:
         return np.float32(0.0), np.float32(0.0)

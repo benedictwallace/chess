@@ -18,7 +18,7 @@ import time
 import torch
 
 from model.network import ChessNet
-from training.self_play_parallel import generate_games_parallel
+from archive.self_play_parallel import generate_games_parallel
 from training.train import ReplayBuffer, train_epoch
 from ease.frac_safe import FracSafeEase
 

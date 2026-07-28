@@ -6,10 +6,12 @@ Given a checkpoint, this script:
   1. loads the net and FREEZES it (trunk, policy head, value head -- nothing
      but new forgiveness heads is ever trained here);
   2. generates self-play games with the frozen net, computing the forgiveness target
-     for EVERY mode ("gap", "entropy", "tree_gap", "tree_entropy", "flat_gap",
-     "flat_entropy") from the SAME search tree at every recorded root -- so
-     the modes are compared on identical positions and identical Q statistics,
-     never on different games;
+     for EVERY mode -- the six original definitions ("gap", "entropy",
+     "tree_gap", "tree_entropy", "flat_gap", "flat_entropy") plus the four
+     PARITY-FILTERED aggregates ("tree_gap_me", "tree_gap_opp",
+     "flat_entropy_me", "flat_entropy_opp") -- from the SAME search tree at
+     every recorded root, so the modes are compared on identical positions
+     and identical Q statistics, never on different games;
   3. trains ONE fresh forgiveness head PER MODE on those targets, all heads
      simultaneously off a single (frozen) trunk forward per batch, reporting
      held-out R^2 per mode per epoch;
@@ -38,6 +40,24 @@ monkey-patch that module-level name with a wrapper that calls the real
 forgiveness_target once per mode and returns float32 VECTORS (K targets, K masks).
 The self-play machinery never looks inside them, so nothing else changes.
 The patch is restored afterwards.
+
+PARITY MODES (the _me / _opp columns): an unfiltered aggregate blends the
+forgiveness of BOTH players' future decision nodes, but the robustness
+objective cares about them differently -- my near-optimal slack absorbs my
+mistakes, the opponent's slack is their escape hatches. The _me modes
+accumulate local F only at the RECORDED MOVER's decision nodes (even depths
+below the search root -- the player whose planes the row encodes); _opp only
+at the opponent's (odd depths). They are generated as SEPARATE columns so a
+signed combination F_me - beta * F_opp is formed at CONSUMPTION time (in a
+selection bonus, or by combining two heads' outputs) -- beta stays a free
+knob that costs no regeneration and no retraining. Two things to expect in
+the results: parity columns aggregate over roughly half the subtree, so they
+are undefined a little more often (their per-mode masks handle that) and
+carry somewhat noisier labels -- a modestly lower R2 than the unfiltered
+column is a statistics artefact before it is evidence the concept is harder;
+and if the checkpoint's own unfiltered head already transfers well to the
+_me column (see eval_checkpoint_head's table), the two definitions are
+highly correlated in practice, which is itself a result worth reporting.
 
 Self-play settings differ from main.py's in two deliberate ways:
   * record_fast_rows=False -- fast rows carry no forgiveness target, useless here;
@@ -79,7 +99,16 @@ import training.self_play_batched as spb
 from search.forgiveness import forgiveness_target as _forgiveness_target_single
 
 ALL_MODES = ["gap", "entropy", "tree_gap", "tree_entropy",
-             "flat_gap", "flat_entropy"]
+             "flat_gap", "flat_entropy",
+             # parity-filtered aggregates (see PARITY MODES in the module
+             # docstring): _me = the recorded mover's decision nodes only,
+             # _opp = the opponent's only. All eight aggregator/statistic/
+             # parity combinations parse (search.forgiveness.forgiveness_target);
+             # these four are the default sweep: the flat entropy pair matches
+             # the current online target family, the tree gap pair the
+             # project doc's recursive formulation.
+             "tree_gap_me", "tree_gap_opp",
+             "flat_entropy_me", "flat_entropy_opp"]
 
 
 # --------------------------------------------------------------------------- #
@@ -128,7 +157,9 @@ def _make_multi_mode_forgiveness_target(modes):
     Modes with an undefined statistic on this root get mask 0 for this row
     only -- the masks are per-mode because e.g. the root-local statistic
     (which respects the forced-visit floor) can be undefined where the
-    tree/flat aggregates are not, and vice versa."""
+    tree/flat aggregates are not, and vice versa. Parity-filtered modes sum
+    over roughly half the subtree's nodes, so expect their columns to be
+    masked somewhat more often than their unfiltered counterparts."""
     def multi(root, floor, tau, mode, gamma=0.85, stat=None):  # noqa: ARG001
         K = len(modes)
         ts = np.zeros(K, dtype=np.float32)
@@ -194,8 +225,11 @@ def generate_dataset(net, modes, args):
           f"({len(examples)} recorded) in {gen_sec/60:.1f} min")
     for i, m in enumerate(modes):
         n = int(masks[:, i].sum())
+        if n == 0:
+            print(f"  {m:<16s} defined on {n:6d} rows   (column all-masked)")
+            continue
         tv = targets[masks[:, i] > 0, i]
-        print(f"  {m:<13s} defined on {n:6d} rows   "
+        print(f"  {m:<16s} defined on {n:6d} rows   "
               f"mean {tv.mean():.3f}  var {tv.var():.4f}")
     return planes, targets, masks
 
@@ -492,7 +526,7 @@ def eval_checkpoint_head(net, ckpt, planes, targets, masks, modes, args,
     print(f"\ncheckpoint's own head (online-trained for {trained_for!r}), "
           f"val R2 per target definition:")
     for m in modes:
-        print(f"  vs {m:<13s} R2 {stats[m]['r2']:+.3f}")
+        print(f"  vs {m:<16s} R2 {stats[m]['r2']:+.3f}")
     return stats
 
 
@@ -526,7 +560,7 @@ def save_heads(ckpt, ckpt_path, best, heads, modes, args):
         path = os.path.join(args.out_dir, f"{stem}_forgiveness_{mode}.pt")
         torch.save({"iteration": ckpt.get("iteration", 0),
                     "model_state": state, "config": cfg}, path)
-        print(f"  {mode:<13s} val R2 {b['r2']:+.3f} (epoch {b['epoch']:3d}) "
+        print(f"  {mode:<16s} val R2 {b['r2']:+.3f} (epoch {b['epoch']:3d}) "
               f"-> {path}")
 
     compact = os.path.join(args.out_dir, "forgiveness_heads_all.pt")
@@ -654,3 +688,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
