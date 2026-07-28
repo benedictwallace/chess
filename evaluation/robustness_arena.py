@@ -63,6 +63,7 @@ import csv
 import math
 import os
 import time
+import zlib
 
 import numpy as np
 import torch
@@ -130,7 +131,7 @@ class Perturber:
 
     def __call__(self, g, visit_counts):
         if g.ply < self.opening_plies:                    # shared opening
-            return select_move(visit_counts, self.opening_temp)
+            return select_move(visit_counts, self.opening_temp, self.rng)
 
         pid = g.search_net
         best = max(visit_counts, key=visit_counts.get)
@@ -145,7 +146,7 @@ class Perturber:
                 return legal[self.rng.integers(len(legal))]
             return self._blunder(visit_counts, best)
         if self.temp_noise > 0:
-            return select_move(visit_counts, self.temp_noise)
+            return select_move(visit_counts, self.temp_noise, self.rng)
         return best
 
 
@@ -188,7 +189,11 @@ def run_level(nets, pairings, level, args, seed):
     for pid, net in nets.items():
         fn = _make_eval_fn(net)
         if pid in pairings["perturbed"]:
-            fn = wrap_value_noise(fn, vnoise, seed + hash(pid) % 10_000)
+            # crc32, NOT hash(): str hashes are salted per process, so hash(pid)
+            # made value-noise streams irreproducible across runs -- the one
+            # place (paper-facing degradation curves) reproducibility matters.
+            fn = wrap_value_noise(fn, vnoise,
+                                  seed + zlib.crc32(pid.encode()) % 10_000)
         eval_fns[pid] = fn
 
     perturb = Perturber(pairings["perturbed"], eps, args.mode,
@@ -214,7 +219,8 @@ def run_level(nets, pairings, level, args, seed):
         opening_plies=args.opening_plies, opening_temp=args.opening_temp,
         max_plies=args.max_plies, concurrency=args.concurrency,
         use_cache=True, cache_cap=args.cache_cap,
-        decide_move=perturb, on_game_done=progress)
+        decide_move=perturb, on_game_done=progress,
+        rng=np.random.default_rng(seed))
 
     by_pairing = {name: [] for name, _, _ in pairings["pairs"]}
     for (name, _i), score in results:

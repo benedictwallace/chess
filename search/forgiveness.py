@@ -81,10 +81,13 @@ plug into either one for a recursive / subtree-level forgiveness):
 
 QUALIFICATION (shared by both statistics): with floor > 0 (a root searched
 under a forced-visit floor) only children with visits >= floor qualify --
-matched-variance Qs -- falling back to the min_kids most-visited children if
-too few qualify; with floor == 0 (interior nodes / unforced trees) all visited
-children qualify. Fewer than min_kids usable children -> the statistic is
-undefined (None), which forgiveness_target turns into a masked-out training row.
+matched-variance Qs; with floor == 0 (interior nodes / unforced trees) all
+visited children qualify. Fewer than min_kids usable children -> the statistic
+is UNDEFINED (None), which forgiveness_target turns into a masked-out training
+row. There is deliberately NO fallback when too few children meet the floor:
+the old fallback compared a floored Q against a barely-visited one, silently
+breaking the matched-variance premise and emitting a high-variance label with
+mask 1.0. A masked row is cheaper than a wrong one.
 
 SETTING TAU: tau is the value-unit scale that decides how much cost counts as
 "brittle" -- rankings between positions do not depend on it, absolute F values
@@ -109,15 +112,12 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 def _qualified(node, min_kids=2, floor=0):
     """Children whose Q estimates are trustworthy enough to compare.
     Returns a list (possibly shorter than min_kids -- callers treat that as
-    'statistic undefined')."""
+    'statistic undefined'). With floor > 0 the list is STRICT: children below
+    the floor never qualify, so too few floored children makes the statistic
+    undefined (masked row) rather than a matched-variance-violating label."""
     if floor > 0:
-        qual = [c for c in node.children if c.visits >= floor]
-        if len(qual) < min_kids:
-            qual = sorted((c for c in node.children if c.visits > 0),
-                          key=lambda c: -c.visits)[:min_kids]
-    else:
-        qual = [c for c in node.children if c.visits > 0]
-    return qual
+        return [c for c in node.children if c.visits >= floor]
+    return [c for c in node.children if c.visits > 0]
 
 
 # --------------------------------------------------------------------------- #

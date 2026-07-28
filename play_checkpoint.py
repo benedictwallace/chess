@@ -1,6 +1,6 @@
 """
 Play against a trained checkpoint on a POPUP BOARD, with the search's visit
-distribution and the ease/forgiveness statistics shown next to the board.
+distribution and the forgiveness statistics shown next to the board.
 
 Default is a tkinter window (ships with Python -- no extra installs): click a
 piece, click its destination. The right-hand panel shows, for every search:
@@ -8,7 +8,7 @@ piece, click its destination. The right-hand panel shows, for every search:
   * a headline readout: eval (mover POV), F_local, F_tree
   * the visit distribution over root moves (visits, %, Q chooser-POV, prior;
     '*' marks moves that met the forced-visit floor, i.e. trustworthy Qs)
-  * the ease block: the two local forgiveness values -- the action gap
+  * the forgiveness block: the two local forgiveness values -- the action gap
     (F_gap = exp(-gap/tau)) and the normalised Q-entropy (with its effective
     move count exp(H)) -- plus the recursive F_tree from the project
     formulation
@@ -17,15 +17,15 @@ Buttons: Analyse (search YOUR position -- suggestion drawn as an arrow),
 Undo (takes back a full move pair), New game, Flip board.
 
 Every search (engine moves and Analyse alike) is the SAME forced-visit,
-no-Dirichlet-noise, fp32 search as probe_ease.py, so numbers here are directly
-comparable to your probe CSVs. The engine runs on a background thread; the
+no-Dirichlet-noise, fp32 search as probe_forgiveness.py, so numbers here are
+directly comparable to your probe CSVs. The engine runs on a background thread; the
 board stays responsive while it thinks.
 
 --terminal restores the old text-mode loop (same commands as before: moves as
 e2e4 / e7e8q, analyse, moves, fen, undo, new, resign/quit).
 
-tau: pass the value probe_ease.py calibrated for this checkpoint (--tau). The
-default 0.05 is a placeholder -- rankings between positions don't depend on
+tau: pass the value probe_forgiveness.py calibrated for this checkpoint
+(--tau). The default 0.05 is a placeholder -- rankings between positions don't depend on
 it, but calibrated tau puts the median position at F ~ 0.5.
 
 Usage (from the repo root):
@@ -45,10 +45,10 @@ import torch
 
 from engine.gameEnv import Chess
 from evaluation.arena import load_net
-from evaluation.probe_ease import (
+from evaluation.probe_forgiveness import (
     _ProbeItem, search_positions, root_q_vector, _uci, _probe_eval_fn,
 )
-from search.ease import ease_from_qs, tree_forgiveness
+from search.forgiveness import forgiveness_from_qs, tree_forgiveness
 
 try:
     from engine.fen import board_to_fen
@@ -110,22 +110,23 @@ def format_distribution(root, force_eff, top=10):
     return "\n".join(lines)
 
 
-def ease_summary(root, force_eff, tau, gamma):
-    """Returns (stats dict or None). stats: st fields + ease fields + f_tree."""
+def forgiveness_summary(root, force_eff, tau, gamma):
+    """Returns (stats dict or None): root_q_vector fields + the
+    forgiveness_from_qs statistics + the recursive f_tree."""
     st = root_q_vector(root, force_eff)
     if st is None:
         return None
-    ease = ease_from_qs(st["qs"], tau)
-    st.update(ease)
+    st.update(forgiveness_from_qs(st["qs"], tau))
     st["f_tree"] = tree_forgiveness(root, gamma, tau)
     return st
 
 
-def format_ease(st, gamma):
+def format_forgiveness(st, gamma):
     ftree = f"{st['f_tree']:.3f}" if st["f_tree"] is not None else "n/a"
     return (f"  eval (mover POV) {st['v_root']:+.3f} | gap {st['gap']:.3f}"
             f" -> F_gap {st['F_gap']:.3f}\n"
-            f"  H_ease {st['ease_entropy']:.3f} | effA {st['eff_actions']:.2f}"
+            f"  H_forg {st['forgiveness_entropy']:.3f}"
+            f" | effA {st['eff_actions']:.2f}"
             f" | F_tree (g={gamma}) {ftree}")
 
 
@@ -176,7 +177,7 @@ class BoardGUI:
         self.busy = False
         self.msgq = queue.Queue()
 
-        tkroot.title("play vs checkpoint -- ease probe view")
+        tkroot.title("play vs checkpoint -- forgiveness probe view")
         main = tk.Frame(tkroot)
         main.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -305,11 +306,12 @@ class BoardGUI:
         self.text.config(state="disabled")
 
     def show_search(self, header, root, force_eff):
-        st = ease_summary(root, force_eff, self.args.tau, self.args.gamma)
+        st = forgiveness_summary(root, force_eff, self.args.tau,
+                                 self.args.gamma)
         block = header + "\n" + format_distribution(root, force_eff,
                                                     self.args.top)
         if st is not None:
-            block += "\n" + format_ease(st, self.args.gamma)
+            block += "\n" + format_forgiveness(st, self.args.gamma)
             ftree = f"{st['f_tree']:.3f}" if st["f_tree"] is not None else "n/a"
             self.headline.config(
                 text=f"F_gap {st['F_gap']:.3f}  F_tree {ftree}  "
@@ -524,9 +526,9 @@ def terminal_main(env, eval_fn, args, human_white):
         print("engine thinking...")
         root, feff = run_search(env, eval_fn, args)
         print(format_distribution(root, feff, args.top))
-        st = ease_summary(root, feff, args.tau, args.gamma)
+        st = forgiveness_summary(root, feff, args.tau, args.gamma)
         if st is not None:
-            print(format_ease(st, args.gamma))
+            print(format_forgiveness(st, args.gamma))
         kids = [c for c in root.children if c.visits > 0]
         if not kids:
             return False
@@ -578,12 +580,12 @@ def terminal_main(env, eval_fn, args, human_white):
             else:
                 print("nothing to undo.")
             continue
-        if cmd in ("analyse", "analyze", "hint", "ease"):
+        if cmd in ("analyse", "analyze", "hint", "forgiveness", "ease"):
             root, feff = run_search(env, eval_fn, args)
             print(format_distribution(root, feff, args.top))
-            st = ease_summary(root, feff, args.tau, args.gamma)
+            st = forgiveness_summary(root, feff, args.tau, args.gamma)
             if st is not None:
-                print(format_ease(st, args.gamma))
+                print(format_forgiveness(st, args.gamma))
                 print(f"    suggested: {st['best_move']}")
             continue
         move = parse_move(cmd, env.legalMoves())
@@ -598,7 +600,8 @@ def terminal_main(env, eval_fn, args, human_white):
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="Play a trained checkpoint on a "
-                                             "popup board with ease statistics")
+                                             "popup board with forgiveness "
+                                             "statistics")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--color", choices=["white", "black", "random"],
                     default="white", help="your color (default white)")
@@ -608,8 +611,8 @@ def main():
     ap.add_argument("--force-m", type=int, default=8)
     ap.add_argument("--force-n", type=int, default=40)
     ap.add_argument("--tau", type=float, default=0.05,
-                    help="ease temperature -- use the value probe_ease "
-                         "calibrated for this checkpoint")
+                    help="forgiveness temperature -- use the value "
+                         "probe_forgiveness calibrated for this checkpoint")
     ap.add_argument("--gamma", type=float, default=0.85,
                     help="decay in the recursive tree forgiveness")
     ap.add_argument("--top", type=int, default=10,
@@ -641,3 +644,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    

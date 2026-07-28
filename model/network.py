@@ -28,23 +28,6 @@ class ResidualBlock(nn.Module):
         return F.relu(x)
 
 
-class ScalarHead(nn.Module):
-    """1x1 conv -> fc -> fc -> scalar, with a configurable output activation."""
-    def __init__(self, channels, activation):
-        super().__init__()
-        self.conv = nn.Conv2d(channels, 1, 1, bias=False)
-        self.bn = nn.BatchNorm2d(1)
-        self.fc1 = nn.Linear(1 * 8 * 8, 64)
-        self.fc2 = nn.Linear(64, 1)
-        self.activation = activation
-
-    def forward(self, x):
-        h = F.relu(self.bn(self.conv(x)))
-        h = h.reshape(h.size(0), -1)
-        h = F.relu(self.fc1(h))
-        return self.activation(self.fc2(h))
-
-
 class ChessNet(nn.Module):
     def __init__(self, channels=64, num_blocks=5, forgiveness_detach=True):
         super().__init__()
@@ -114,4 +97,5 @@ class ChessNet(nn.Module):
         forgiveness = torch.sigmoid(self.forgiveness_fc2(e))
 
         return policy_logits, value, forgiveness
-        
+
+    

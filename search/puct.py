@@ -1,12 +1,12 @@
 import math
-import torch
+
 import numpy as np
 
 from model.encoding import encode_env
 from model.move_encoding import encodeMove, encodeMovePOV, NUM_ACTIONS
 from engine.moves import Move
 
-def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
+def _add_dirichlet_noise(root, alpha=0.3, frac=0.25, rng=None):
     """
     Mix Dirichlet noise into priors
         p' = (1 - frac) * p + frac * noise
@@ -14,7 +14,8 @@ def _add_dirichlet_noise(root, alpha=0.3, frac=0.25):
     """
     if not root.children:
         return
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     noise = rng.dirichlet([alpha] * len(root.children))
     for child, n in zip(root.children, noise):
         child.prior = (1 - frac) * child.prior + frac*n
@@ -27,6 +28,11 @@ def evaluate(net, env, legal=None):
         priors: dict {Move: probability} over LEGAL moves only
         value:  float in [-1, 1], from the mover's perspective
     """
+    import torch   # lazy: keeps this module torch-free to IMPORT, so the
+                   # torch-free consumers (score_elo_batched's core runner,
+                   # probe/robustness fakes) that pull node_fpu_q from here
+                   # stay unit-testable on a machine without torch.
+
     board = env.board
     if legal is None:
         legal = env.legalMoves()
@@ -60,6 +66,9 @@ def evaluate(net, env, legal=None):
 
 
 class Node:
+    __slots__ = ("parent", "move", "prior", "children",
+                 "visits", "value", "moverSign", "terminal", "expanded")
+
     def __init__(self, parent=None, move=None, prior=0.0):
         self.parent = parent
         self.move = move
@@ -114,10 +123,13 @@ def puctScore(child, parent, c=1.5, fpu_q=0.0):
 
 
 def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alpha=0.3, 
-               noise_frac=0.25, fpu_reduction=0.25) -> tuple[Node, dict[Move, int]]:
+               noise_frac=0.25, fpu_reduction=0.25,
+               rng=None) -> tuple[Node, dict[Move, int]]:
     """
     Executes MCTS iteration steps. fpu_reduction: first-play-urgency penalty
     for unvisited children (see node_fpu_q); 0 restores the legacy q=0 init.
+    rng: optional np.random.Generator for the Dirichlet noise -- pass a seeded
+    one for reproducible searches (default: fresh nondeterministic entropy).
     """
     root = Node()
     root.moverSign = 0
@@ -158,7 +170,7 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
                     node.children.append(child)
                 node.expanded = True
                 if add_noise and node is root:
-                    _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
+                    _add_dirichlet_noise(root, dirichlet_alpha, noise_frac, rng)
 
         # 3. BACKPROPATION
         for n in path:
@@ -169,9 +181,10 @@ def search(rootEnv, net, iterations=400, c=1.5, add_noise = True, dirichlet_alph
     return root, visit_counts
 
 
-def select_move(visit_counts, temp=1.0):
+def select_move(visit_counts, temp=1.0, rng=None):
     """
-    Choose move from root visit counts.
+    Choose move from root visit counts. rng: optional seeded Generator for
+    reproducible temperature sampling.
     """
     moves = list(visit_counts.keys())
     counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
@@ -181,5 +194,7 @@ def select_move(visit_counts, temp=1.0):
     
     logits = counts ** (1.0 / temp)
     probs = logits / logits.sum()
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
+

@@ -1,7 +1,8 @@
 """
-Recover / recompute the ease temperature tau from an ease_probe.csv.
+Recover / recompute the forgiveness temperature tau from a
+forgiveness_probe.csv (written by probe_forgiveness.py).
 
-The calibration rule (same as probe_ease.py's auto mode):
+The calibration rule (same as probe_forgiveness.py's auto mode):
 
     F_gap = exp(-gap / tau)  should map the MEDIAN gap to F = 0.5
     =>  tau = median(gap) / ln 2
@@ -9,7 +10,7 @@ The calibration rule (same as probe_ease.py's auto mode):
 One tau serves both local statistics: inside the entropy's softmax(Q / tau)
 it plays the identical "how much Q-cost still counts as near-optimal" role.
 As a cross-check this script also reports the tau at which the median
-ease_entropy would land exactly on 0.5 -- recomputed from (q1, q2) pairs, the
+forgiveness_entropy would land exactly on 0.5 -- recomputed from (q1, q2) pairs, the
 2-move entropy H(softmax([q1,q2]/tau)) / ln 2, which is a lower-bound proxy
 since the CSV doesn't store the full Q vectors. If the two taus are within a
 factor of ~1.5 of each other, keep the shared gap-derived tau.
@@ -19,8 +20,8 @@ the stored F_gap median?) and prints the implied F at the gap percentiles so
 you can see the target contrast a given tau produces.
 
 Usage:
-    python calibrate_tau.py ease_probe.csv
-    python calibrate_tau.py ease_probe.csv --tau 0.05   # audit a specific tau
+    python calibrate_tau.py forgiveness_probe.csv
+    python calibrate_tau.py forgiveness_probe.csv --tau 0.05  # audit a given tau
 """
 
 import argparse
@@ -93,7 +94,8 @@ def pct(xs, ps=(10, 25, 50, 75, 90)):
 
 def main():
     ap = argparse.ArgumentParser(description="tau calibration from a probe CSV")
-    ap.add_argument("csv", help="ease_probe.csv written by probe_ease.py")
+    ap.add_argument("csv",
+                    help="forgiveness_probe.csv written by probe_forgiveness.py")
     ap.add_argument("--tau", type=float, default=0.0,
                     help="also audit this specific tau (e.g. the 0.05 "
                          "placeholder your training run is using)")
@@ -109,7 +111,7 @@ def main():
     print("gap percentiles: " +
           "  ".join(f"p{p}={v:.4f}" for p, v in pct(gaps).items()))
     print(f"\ntau (median gap / ln 2)      = {tau_gap:.4f}"
-          f"   <-- freeze this as ease_tau for the next training run")
+          f"   <-- freeze this as forgiveness_tau for the next training run")
 
     # entropy cross-check from (q1, q2) pairs
     pairs = [(float(r["q1"]), float(r["q2"])) for r in usable]
@@ -149,3 +151,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    

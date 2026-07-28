@@ -180,11 +180,16 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             scaler.scale(loss_pv).backward()
             scaler.step(optimiser)
             scaler.update()
-            # ---- step 2: forgiveness head only, its own optimiser ----
-            eopt = forgiveness_optimiser if forgiveness_optimiser is not None else optimiser
-            scaler.scale(forgiveness_weight * forgiveness_loss).backward()
-            scaler.step(eopt)
-            scaler.update()
+            # ---- step 2: forgiveness head only, its own optimiser. SKIPPED
+            # when the batch has no forgiveness-labelled rows: the masked loss
+            # is 0 with zero gradient, but Adam's weight_decay (plus stale
+            # momentum) would still shrink the head a little on every empty
+            # batch -- a slow drift toward the origin driven by nothing. ----
+            if emask.sum().item() > 0:
+                eopt = forgiveness_optimiser if forgiveness_optimiser is not None else optimiser
+                scaler.scale(forgiveness_weight * forgiveness_loss).backward()
+                scaler.step(eopt)
+                scaler.update()
             loss = loss_pv + forgiveness_weight * forgiveness_loss    # combined, logging only
         else:
             loss = loss_pv
@@ -214,3 +219,4 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
     if actual == 0:
         return {**{k: 0.0 for k in acc}, **forgiveness_stats}
     return {**{k: v / actual for k, v in acc.items()}, **forgiveness_stats}
+

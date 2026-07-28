@@ -1,7 +1,6 @@
-import copy
-
 from engine.bitboard import (
     bb_from_string, bb_to_string, lsb,
+    notAfile, notHfile,
     mustBeEmptyKwhite, mustBeEmptyQwhite,
     mustBeEmptyKblack, mustBeEmptyQblack,
 )
@@ -518,9 +517,20 @@ class Board:
             self.bb[oppColour, "pawn"] &= ~(1 << capturedSq)
             self.mailbox[capturedSq] = None
 
-        # update enpensantsq + castling rights
+        # update en-passant square + castling rights.
+        # Only record an en-passant square when an enemy pawn stands directly
+        # beside the pushed pawn -- i.e. when an ep capture is actually
+        # available next move. A "phantom" ep square (set after EVERY double
+        # push) never changed the legal move set (an ep capture needs that
+        # adjacent pawn anyway), but it leaked into stateKey() and encoding
+        # plane 16: threefold repetition under-counted (identical playable
+        # positions got distinct keys) and the net saw a meaningless input bit.
         if piece == "pawn" and abs(move.toSq - move.fromSq) == 16:
-            self.enPassantSq = (move.fromSq + move.toSq) // 2
+            adjacent = ((toBB & notAfile) >> 1) | ((toBB & notHfile) << 1)
+            if self.bb[oppColour, "pawn"] & adjacent:
+                self.enPassantSq = (move.fromSq + move.toSq) // 2
+            else:
+                self.enPassantSq = -1
         else:
             self.enPassantSq = -1
 
@@ -682,3 +692,5 @@ if __name__ == "__main__":
     print(perft(b, "white", 2))
     print(perft(b, "white", 3))
     print(perft(b, "white", 4))
+
+    

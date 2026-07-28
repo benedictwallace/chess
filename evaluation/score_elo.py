@@ -14,8 +14,8 @@ Match results are cached to elo_matches.csv as they complete, so a long
 evaluation can be interrupted and resumed without replaying games.
 
 Usage:
-    python elo.py --ckpt-dir checkpoints --games 20 --iterations 40
-    python elo.py --ckpt-dir checkpoints --round-robin          # fuller, O(n^2)
+    python score_elo.py --ckpt-dir checkpoints --games 20 --iterations 40
+    python score_elo.py --ckpt-dir checkpoints --round-robin    # fuller, O(n^2)
 """
 
 import argparse
@@ -214,3 +214,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    

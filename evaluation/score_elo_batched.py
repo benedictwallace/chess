@@ -48,7 +48,7 @@ import csv
 from engine.gameEnv import Chess
 from model.encoding import encode_env
 from search.puct import node_fpu_q
-from model.move_encoding import encodeMovePOV, NUM_ACTIONS
+from model.move_encoding import encodeMovePOV
 
 
 # --------------------------------------------------------------------------- #
@@ -76,12 +76,6 @@ def _softmax(x):
     return e / e.sum()
 
 
-def _puct_score(child, parent, c):
-    q = 0.0 if child.visits == 0 else child.value / child.visits
-    u = c * child.prior * math.sqrt(parent.visits) / (1 + child.visits)
-    return q + u
-
-
 def _expand(node, priors, mover):
     sign = 1 if mover == "white" else -1
     for m, p in priors.items():
@@ -97,14 +91,15 @@ def _backprop(path, leaf_value_white):
         n.value += leaf_value_white * n.moverSign
 
 
-def select_move(visit_counts, temp):
+def select_move(visit_counts, temp, rng=None):
     moves = list(visit_counts.keys())
     counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
     if temp <= 1e-6 or counts.sum() == 0:
         return moves[int(counts.argmax())]
     logits = counts ** (1.0 / temp)
     probs = logits / logits.sum()
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
 
 
@@ -140,7 +135,7 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                             fpu_reduction=0.25,
                             opening_plies=8, opening_temp=1.0, max_plies=160,
                             concurrency=128, use_cache=True, cache_cap=250_000,
-                            on_game_done=None, decide_move=None):
+                            on_game_done=None, decide_move=None, rng=None):
     """
     tickets : list of (pidx, a_is_white, white_mover, black_mover)
               white_mover/black_mover is a net_id str (neural) or an anchor agent.
@@ -153,6 +148,9 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
               .search_net (the mover's net_id), .env, .ply, .root -- enough for
               perturbed / forgiveness-aware selection. The callback owns ALL
               temperature handling, including the opening.
+    rng     : optional seeded np.random.Generator for the default opening-
+              temperature sampling (reproducible evaluation runs). Ignored
+              when decide_move is given -- the callback owns its randomness.
 
     Returns list of (pidx, a_score) for every ticket (a_score in {0.0,0.5,1.0}).
     """
@@ -305,7 +303,7 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                     move = decide_move(g, visit_counts)
                 else:
                     temp = opening_temp if g.ply < opening_plies else 0.0
-                    move = select_move(visit_counts, temp)
+                    move = select_move(visit_counts, temp, rng)
                 g.env.step(move)
                 g.ply += 1
                 if g.env.isTerminal() or g.ply >= max_plies:
@@ -576,6 +574,12 @@ def main():
                          "Each worker loads only the nets its pairings need.")
     ap.add_argument("--stride", type=int, default=1,
                     help="test every Nth checkpoint (1 = all); final always kept")
+    ap.add_argument("--every-iters", type=int, default=0,
+                    help="keep ~1 checkpoint per this many ITERATIONS "
+                         "(0 = off; overrides --stride). Final always kept.")
+    ap.add_argument("--last-iters", type=int, default=0,
+                    help="only score checkpoints within this many iterations of "
+                         "the final one (0 = all). Applied before --every-iters/--stride.")
     ap.add_argument("--round-robin", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--cache-cap", type=int, default=250_000)
@@ -590,7 +594,18 @@ def main():
     if not ckpts:
         print(f"no net_iter*.pt found in {args.ckpt_dir}")
         return
-    if args.stride > 1:
+    if args.last_iters > 0:
+        cutoff = ckpts[-1][0] - args.last_iters    # relative to final checkpoint
+        ckpts = [(it, p) for it, p in ckpts if it >= cutoff]
+    if args.every_iters > 0:
+        kept, last = [], None
+        for it, p in ckpts:                      # ascending by iteration
+            if last is None or it - last >= args.every_iters:
+                kept.append((it, p)); last = it
+        if ckpts[-1] not in kept:
+            kept.append(ckpts[-1])
+        ckpts = kept
+    elif args.stride > 1:
         kept = ckpts[::args.stride]
         if ckpts[-1] not in kept:
             kept.append(ckpts[-1])
@@ -752,3 +767,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    

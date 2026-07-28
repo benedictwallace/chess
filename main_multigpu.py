@@ -31,9 +31,10 @@ noisy plateau. Two changes fix this:
      empty spool does not deadlock the learner. 8x matches the implicit ratio
      of the synchronous main.py (100 batches x 256 consumed vs ~4-5k generated
      per iteration ~= 5-8x), which trained healthily.
-  2. `min_buffer` warmup floor raised to buffer_capacity // 4 (50k at the
-     default 200k capacity) instead of buffer_capacity // 100 (2k). The old
-     floor let the learner hammer the first ~2k positions at the peak LR.
+  2. `min_buffer` warmup floor raised to buffer_capacity // 4 (150k at the
+     current 600k capacity -- a long warmup at ~16 recorded positions/sec;
+     pass --min-buffer to override) instead of buffer_capacity // 100 (2k).
+     The old floor let the learner hammer the first ~2k positions at peak LR.
 
 The throttle means the learner may spend long stretches sleeping while actors
 catch up -- that is the intended behavior (it is the actors that are the
@@ -234,9 +235,10 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     if games_per_chunk is None:
         games_per_chunk = max(1, cfg["concurrency"])        # one full batch-wave
     if min_buffer is None:
-        # WARMUP FLOOR: a quarter of the buffer, not one percent. The old
-        # buffer_capacity // 100 (= 2k examples) let training start on a token
-        # dataset at the peak LR -- the net overfit it before real data existed.
+        # WARMUP FLOOR: a quarter of the buffer (150k at the current 600k
+        # capacity), not one percent. The old buffer_capacity // 100 (= 2k
+        # examples) let training start on a token dataset at the peak LR --
+        # the net overfit it before real data existed.
         min_buffer = max(cfg["batch_size"], cfg["buffer_capacity"] // 4)
     checkpoint_every_steps = cfg["checkpoint_every"] * cfg["train_batches"]
     max_pending = max(1, max_pending_per_actor * max(1, n_actors))
@@ -474,5 +476,5 @@ if __name__ == "__main__":
          train_block=args.train_block, games_per_chunk=args.games_per_chunk,
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
-    
+
     

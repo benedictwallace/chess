@@ -123,7 +123,7 @@ CONFIG = dict(
     # ---- forgiveness TARGET generation (now explicit; previously these silently
     # used the defaults inside self_play_batched, so a calibrated tau never
     # reached the actors in the async runner) ----
-    forgiveness_targets=True,  # STRENGTH PUSH: off. Forgiveness labels cost
+    forgiveness_targets=False, # STRENGTH PUSH: off. Forgiveness labels cost
                                 # forgiveness_extra_sims per full move (+~12%)
                                 # and, with the forced floor below, divert
                                 # ~half the root budget into equalising the
@@ -244,8 +244,11 @@ def cosine_lr(it, base_lr, lr_min, total):
 
 def main(cfg=CONFIG):
     """
-    Run the baseline self-play -> train -> checkpoint loop (policy + value only),
-    logging the policy and value losses.
+    Run the self-play -> train -> checkpoint loop, logging losses per
+    iteration. With CONFIG["forgiveness_targets"] on, self-play also computes
+    forgiveness labels and train_epoch trains the (decoupled) forgiveness
+    head; off (the strength-push configuration) it is the plain policy+value
+    loop and the forgiveness metric columns log zeros.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -434,3 +437,5 @@ def main(cfg=CONFIG):
 
 if __name__ == "__main__":
     main()
+
+    

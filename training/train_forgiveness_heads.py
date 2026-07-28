@@ -13,10 +13,15 @@ Given a checkpoint, this script:
   3. trains ONE fresh forgiveness head PER MODE on those targets, all heads
      simultaneously off a single (frozen) trunk forward per batch, reporting
      held-out R^2 per mode per epoch;
-  4. saves, for each mode, a full checkpoint (frozen backbone + that mode's
-     head, loadable by play_checkpoint / probe_forgiveness / arena exactly like a
-     normal net_iterN.pt), plus one compact file with all heads and a metrics
-     CSV.
+  4. saves, for each mode: a full checkpoint (frozen backbone + that mode's
+     BEST-val-R2 head, loadable by play_checkpoint / probe_forgiveness /
+     arena exactly like a normal net_iterN.pt); a compact all-heads file
+     (best + final state per mode); a metrics CSV; and
+     forgiveness_heads_history.pt with EVERY head's state at every
+     --snapshot-every epochs (rewritten incrementally, so an interrupted run
+     keeps its trajectory). Load a specific snapshot with e.g.
+         h = torch.load("forgiveness_heads_history.pt")
+         head.load_state_dict(h["history"]["flat_entropy"][25]["state"])
 
 Why this is sound: ChessNet's forgiveness head reads DETACHED trunk features
 (forgiveness_detach=True), so in the online loop the forgiveness loss already trains only
@@ -331,7 +336,18 @@ def train_heads(net, planes, targets, masks, modes, args, device):
     One trunk forward (or cached-feature fetch) serves every head in the
     batch; head losses are summed into a single backward -- gradients cannot
     interact because the heads are parameter-disjoint and the features carry
-    no graph. Returns {mode: best_state_dict}, {mode: best_val_stats}."""
+    no graph.
+
+    Every head is snapshotted every --snapshot-every epochs (default: every
+    epoch) into forgiveness_heads_history.pt -- heads are ~4.4k params
+    (~18 KB), so keeping the whole trajectory is essentially free. The file
+    is rewritten at each snapshot, so an interrupted run keeps everything
+    trained so far. The best-val-R2 snapshot per mode is still tracked
+    separately (it is what gets merged into the per-mode full checkpoints).
+
+    Returns (heads, best, history): the live end-of-training modules, the
+    per-mode best-snapshot records, and history[mode][epoch] -> CPU
+    state_dict."""
     N = len(planes)
     n_val = max(1, int(N * args.val_frac))
     tr = slice(0, N - n_val)             # contiguous tail split: see module
@@ -360,6 +376,12 @@ def train_heads(net, planes, targets, masks, modes, args, device):
 
     rng = np.random.default_rng(args.seed)
     best = {m: dict(r2=-np.inf, state=None, epoch=0) for m in modes}
+    history = {m: {} for m in modes}     # history[mode][epoch] = state_dict
+    hist_path = os.path.join(args.out_dir, "forgiveness_heads_history.pt")
+
+    def _snapshot(head):
+        return {k: t.detach().cpu().clone()
+                for k, t in head.state_dict().items()}
 
     csv_path = os.path.join(args.out_dir, "forgiveness_heads_metrics.csv")
     csv_f = open(csv_path, "w")
@@ -412,14 +434,32 @@ def train_heads(net, planes, targets, masks, modes, args, device):
             if v["r2"] > best[mode]["r2"]:
                 best[mode] = dict(
                     r2=v["r2"], epoch=epoch, mse=v["mse"], var=v["var"],
-                    state={k: t.detach().cpu().clone()
-                           for k, t in heads[mode].state_dict().items()})
+                    state=_snapshot(heads[mode]))
+
+        # ---- store EVERY head this epoch (BN running stats included), and
+        # rewrite the history file so a crash loses nothing already trained.
+        # val stats ride along so a snapshot can be picked by its R2 later
+        # without re-reading the CSV. ----
+        if epoch % args.snapshot_every == 0 or epoch == args.epochs:
+            for mode in modes:
+                history[mode][epoch] = dict(state=_snapshot(heads[mode]),
+                                            val_R2=val[mode]["r2"],
+                                            val_mse=val[mode]["mse"])
+            torch.save({"history": history,
+                        "_meta": dict(tau=args.tau, gamma=args.gamma,
+                                      modes=modes, seed=args.seed,
+                                      epochs=args.epochs,
+                                      snapshot_every=args.snapshot_every)},
+                       hist_path)
+
         csv_f.flush()
         print("  ".join(line))
 
     csv_f.close()
     print(f"metrics -> {csv_path}")
-    return heads, best
+    print(f"per-epoch head snapshots -> {hist_path} "
+          f"(history[mode][epoch]['state'])")
+    return heads, best, history
 
 
 # --------------------------------------------------------------------------- #
@@ -459,10 +499,12 @@ def eval_checkpoint_head(net, ckpt, planes, targets, masks, modes, args,
 # --------------------------------------------------------------------------- #
 # saving
 # --------------------------------------------------------------------------- #
-def save_heads(ckpt, ckpt_path, best, modes, args):
-    """Per mode: a FULL checkpoint (frozen backbone + this head, config
-    updated so downstream tools see the right mode/tau) -- plus one compact
-    all-heads file for cheap reloading in analysis notebooks."""
+def save_heads(ckpt, ckpt_path, best, heads, modes, args):
+    """Per mode: a FULL checkpoint (frozen backbone + the BEST-val-R2 head,
+    config updated so downstream tools see the right mode/tau) -- plus one
+    compact all-heads file holding both the best and the final-epoch state
+    per mode. The full per-epoch trajectory lives in
+    forgiveness_heads_history.pt, written incrementally during training."""
     base_state = {k: v.cpu() for k, v in ckpt["model_state"].items()}
     base_cfg = dict(ckpt.get("config", {}))
     stem = os.path.splitext(os.path.basename(ckpt_path))[0]
@@ -489,13 +531,15 @@ def save_heads(ckpt, ckpt_path, best, modes, args):
 
     compact = os.path.join(args.out_dir, "forgiveness_heads_all.pt")
     torch.save({m: dict(state=best[m]["state"], val_R2=best[m]["r2"],
-                        best_epoch=best[m]["epoch"])
+                        best_epoch=best[m]["epoch"],
+                        final_state={k: t.detach().cpu().clone()
+                                     for k, t in heads[m].state_dict().items()})
                 for m in modes if best[m]["state"] is not None}
                | {"_meta": dict(checkpoint=os.path.abspath(ckpt_path),
                                 tau=args.tau, gamma=args.gamma,
                                 modes=modes)},
                compact)
-    print(f"  all heads (compact)          -> {compact}")
+    print(f"  all heads (best + final)     -> {compact}")
 
 
 # --------------------------------------------------------------------------- #
@@ -548,6 +592,10 @@ def parse_args():
     p.add_argument("--lr-min", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--val-frac", type=float, default=0.1)
+    p.add_argument("--snapshot-every", type=int, default=1,
+                   help="store every head's state every N epochs in "
+                        "forgiveness_heads_history.pt (last epoch always "
+                        "stored); 1 = every epoch")
     p.add_argument("--cache-features", action="store_true",
                    help="precompute trunk features once (fp16, CPU RAM); "
                         "removes all trunk forwards from the epoch loop")
@@ -596,12 +644,12 @@ def main():
 
     # ---- train one fresh head per mode ----
     print(f"\ntraining {len(args.modes)} heads for {args.epochs} epochs")
-    _, best = train_heads(net, planes, targets, masks, args.modes,
-                          args, device)
+    heads, best, _history = train_heads(net, planes, targets, masks,
+                                        args.modes, args, device)
 
     # ---- save + final table ----
     print("\nbest held-out R2 per target definition:")
-    save_heads(ckpt, args.checkpoint, best, args.modes, args)
+    save_heads(ckpt, args.checkpoint, best, heads, args.modes, args)
 
 
 if __name__ == "__main__":

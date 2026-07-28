@@ -76,8 +76,9 @@ terminal result is scored by material adjudication first -- a lead of
 the cap is NOT labelled a hard 0.0 draw (that taught the value head that any
 advantage smaller than the margin, and any win needing more than max_plies,
 is worthless); its value target is bootstrapped from the LAST recorded
-full-search root value (white POV, continuous in [-1, 1]). True terminal
-draws (stalemate, threefold, fifty-move) are still 0.0.
+FULL-SEARCH root value (white POV, continuous in [-1, 1]) -- fast rows are
+skipped when scanning back, since their playout-capped root values are far
+noisier. True terminal draws (stalemate, threefold, fifty-move) are still 0.0.
 
 Two optional throughput features cut the number of network evaluations (the
 dominant cost) -- see run_selfplay:
@@ -109,16 +110,6 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def _policy_target(visit_counts, sideToMove):
-    target = np.zeros(NUM_ACTIONS, dtype=np.float32)
-    total = sum(visit_counts.values())
-    if total == 0:
-        return target
-    for move, count in visit_counts.items():
-        target[encodeMovePOV(move, sideToMove)] = count / total
-    return target
-
-
 _EMPTY_POLICY = (np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32))
 
 
@@ -146,14 +137,15 @@ def _position_value_white(root, mover_sign):
     return v_mover * mover_sign
 
 
-def select_move(visit_counts, temp=1.0):
+def select_move(visit_counts, temp=1.0, rng=None):
     moves = list(visit_counts.keys())
     counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
     if temp <= 1e-6 or counts.sum() == 0:
         return moves[int(counts.argmax())]
     logits = counts ** (1.0 / temp)
     probs = logits / logits.sum()
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     return moves[rng.choice(len(moves), p=probs)]
 
 
@@ -173,23 +165,18 @@ class Node:
         self.expanded = False
 
 
-def _puct_score(child, parent, c):
-    q = 0.0 if child.visits == 0 else child.value / child.visits
-    u = c * child.prior * math.sqrt(parent.visits) / (1 + child.visits)
-    return q + u
-
-
-def _add_dirichlet_noise(root, alpha, frac):
+def _add_dirichlet_noise(root, alpha, frac, rng=None):
     if not root.children:
         return
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     noise = rng.dirichlet([alpha] * len(root.children))
     for child, n in zip(root.children, noise):
         child.prior = (1 - frac) * child.prior + frac * n
 
 
 def _expand(node, priors, mover, add_noise, is_root,
-            dirichlet_alpha, noise_frac):
+            dirichlet_alpha, noise_frac, rng=None):
     """Attach children to `node` from a {Move: prior} dict."""
     sign = 1 if mover == "white" else -1
     for m, p in priors.items():
@@ -198,7 +185,7 @@ def _expand(node, priors, mover, add_noise, is_root,
         node.children.append(child)
     node.expanded = True
     if add_noise and is_root:
-        _add_dirichlet_noise(node, dirichlet_alpha, noise_frac)
+        _add_dirichlet_noise(node, dirichlet_alpha, noise_frac, rng)
 
 
 def _backprop(path, leaf_value_white):
@@ -252,10 +239,16 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  forgiveness_gamma=0.85, forgiveness_extra_sims=100, forgiveness_force_m=6,
                  fpu_reduction=0.25, value_target_lambda=0.7,
                  record_fast_rows=True,
+                 seed=None,
                  verbose=True):
     """
     Play `num_games` games, keeping up to `concurrency` of them running at once
     and batching their leaf evaluations.
+
+    seed: seeds ONE np.random.Generator that drives every random draw in this
+    call (playout-cap coin flips, Dirichlet noise, temperature sampling), so a
+    fixed seed plus a deterministic eval_fn reproduces the games exactly.
+    None (default) keeps the fresh-entropy behavior for training diversity.
 
     eval_fn(planes_list) -> (logits, values)
         planes_list : list of (19,8,8) float32 arrays
@@ -321,7 +314,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     root_force_m = max(0, int(root_force_m))
     full_force_m = max(root_force_m, int(forgiveness_force_m)) if forgiveness_targets \
         else root_force_m
-    move_rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)   # single source of randomness (see `seed`)
 
     active = [_GameState() for _ in range(concurrency)]
     started = len(active)
@@ -344,7 +337,20 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 # see the module docstring.
                 rwp = g.env.adjudicate()
                 if rwp == 0.0 and g.history:
-                    rwp = float(g.history[-1][3])
+                    # Bootstrap from the last FULL-SEARCH root value. With
+                    # record_fast_rows on, history[-1] is usually a fast
+                    # (playout-capped) row whose ~100-sim root value is a much
+                    # noisier label; scan back for the last row with a
+                    # non-empty policy target (= full-search row) and only
+                    # fall back to the final row if the game had none.
+                    v_boot = None
+                    for row in reversed(g.history):
+                        pol = row[1]
+                        if isinstance(pol, tuple) and len(pol[0]):
+                            v_boot = row[3]
+                            break
+                    rwp = float(v_boot if v_boot is not None
+                                else g.history[-1][3])
         out = []
         lam = value_target_lambda
         for (planes, policy_t, mover_sign, v_white, forgiveness_t, forgiveness_m) in g.history:
@@ -411,7 +417,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                               forgiveness_t, forgiveness_m))
 
         temp = 1.0 if g.ply < temp_moves else 0.0
-        move = select_move(visit_counts, temp)
+        move = select_move(visit_counts, temp, rng)
         for ch in root.children:           # remember picked child -> subtree reuse
             if ch.move == move:
                 g.chosen = ch
@@ -438,7 +444,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         randomization; full moves carry the forgiveness_extra_sims extension) and the
         forced-visit configuration. sims_done starts at the (possibly reused)
         root's visit count so the budget counts what the tree already holds."""
-        full = move_rng.random() < full_search_prob
+        full = rng.random() < full_search_prob
         g.is_full_move = full
         g.move_cap = full_cap if full else fast_cap
         g.sims_done = g.root.visits
@@ -453,7 +459,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         # A reused root is already expanded, so _expand never re-fires on it;
         # apply its root noise here instead (fresh roots get noise in _expand).
         if g.root.expanded and full and add_noise:
-            _add_dirichlet_noise(g.root, dirichlet_alpha, noise_frac)
+            _add_dirichlet_noise(g.root, dirichlet_alpha, noise_frac, rng)
 
     for g in active:
         _begin_move(g)
@@ -547,7 +553,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 if hit is not None:
                     priors, value = hit
                     _expand(node, priors, mover, add_noise and g.is_full_move,
-                            node is g.root, dirichlet_alpha, noise_frac)
+                            node is g.root, dirichlet_alpha, noise_frac, rng)
                     _backprop(path, value if mover == "white" else -value)
                     g.sims_done += 1
                     continue
@@ -567,7 +573,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 if cache is not None and len(cache) < cache_cap:
                     cache[(bkey, env.halfmove_clock, rep)] = (priors, value)
                 _expand(node, priors, mover, add_noise and g.is_full_move,
-                        node is g.root, dirichlet_alpha, noise_frac)
+                        node is g.root, dirichlet_alpha, noise_frac, rng)
                 _backprop(path, value if mover == "white" else -value)
                 g.sims_done += 1
 
@@ -639,6 +645,7 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            forgiveness_extra_sims=100, forgiveness_force_m=6,
                            fpu_reduction=0.25, value_target_lambda=0.7,
                            record_fast_rows=True,
+                           seed=None,
                            verbose=True):
     """
     Drop-in replacement for generate_games_parallel. Returns a flat list of
@@ -675,6 +682,7 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         forgiveness_extra_sims=forgiveness_extra_sims, forgiveness_force_m=forgiveness_force_m,
         fpu_reduction=fpu_reduction, value_target_lambda=value_target_lambda,
         record_fast_rows=record_fast_rows,
+        seed=seed,
         verbose=verbose,
     )
 
