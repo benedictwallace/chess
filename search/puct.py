@@ -28,10 +28,7 @@ def evaluate(net, env, legal=None):
         priors: dict {Move: probability} over LEGAL moves only
         value:  float in [-1, 1], from the mover's perspective
     """
-    import torch   # lazy: keeps this module torch-free to IMPORT, so the
-                   # torch-free consumers (score_elo_batched's core runner,
-                   # probe/robustness fakes) that pull node_fpu_q from here
-                   # stay unit-testable on a machine without torch.
+    import torch   # lazy: keeps this module torch-free to IMPORT
 
     board = env.board
     if legal is None:
@@ -82,7 +79,8 @@ class Node:
 
 
 def node_fpu_q(node, fpu_reduction):
-    """First-play urgency: the Q an UNVISITED child of `node` is assumed to
+    """
+    First-play urgency: the Q an UNVISITED child of `node` is assumed to
     have, from the perspective of the player choosing at `node`.
 
     Plain PUCT's q=0 for unvisited children is a hidden bias: when the chooser
@@ -205,7 +203,8 @@ def select_move(visit_counts, temp=1.0, rng=None):
 # --------------------------------------------------------------------------- #
 def gumbel_scores(root, c_visit=50.0, c_scale=1.0, min_visits=1,
                   include_unvisited=False):
-    """Per-child Gumbel selection scores at a finished root:
+    """
+    Per-child Gumbel selection scores at a finished root:
 
         score(a) = log prior(a) + (c_visit + max_b N(b)) * c_scale * q_hat(a)
 

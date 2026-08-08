@@ -1,3 +1,8 @@
+"""
+Environment to play chess games, make moves and track terminality and states.
+"""
+
+
 from engine.moves import Move
 from engine.board import Board
 
@@ -123,3 +128,5 @@ class Chess:
         if diff <= -margin:
             return -1.0
         return 0.0
+
+    

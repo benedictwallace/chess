@@ -1,3 +1,18 @@
+"""
+Bit board representations and functions.
+    bit boards to and from string functions:
+        bb_to_string()
+        bb_from_string()
+
+    bit collecting, lowest and highest bits, used for getting index of first or last bits:
+        lsb() 
+        msb()
+
+    File variables for move constructions.
+"""
+
+
+
 def bb_to_string(bb: int) -> str:
     rows = []
     for rank in range(7, -1, -1):  # rank 8 down to rank 1
@@ -203,3 +218,4 @@ cantBeAttackedQwhite = bb_from_string("""
                                 0 0 0 0 0 0 0 0
                                 0 0 1 1 1 0 0 0
 """)
+

@@ -1,3 +1,10 @@
+"""
+Board class, containing all piece bitboards and move functions.
+also perft to verify game rules correct.
+"""
+
+
+
 from engine.bitboard import (
     bb_from_string, bb_to_string, lsb,
     notAfile, notHfile,

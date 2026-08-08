@@ -20,6 +20,13 @@ Design notes
 * Game rules/terminality are decided by YOUR env (engine.gameEnv.Chess), same
   as training and the internal arena, so numbers are comparable. The
   python-chess board is only a mirror used to talk to the UCI engine.
+* Games are played from a shared OPENING BOOK (evaluation.openings.BOOK):
+  both seats start from the same position and each line is played once with
+  each colour. Previously the only diversity came from NeuralAgent's
+  opening_plies=8 with opening_temp=1.0 -- the net sampled its own first eight
+  plies at temperature 1 while the UCI engine played its best move from move
+  one, so the measured rating included a one-sided handicap. --no-book
+  restores the old bare-start-position behaviour.
 * Results are cached to a CSV in the same (a,b,a_wins,draws,b_wins,games)
   format as elo_matches.csv, so a long gauntlet is resumable, and the fit can
   merge internal + external matches into one Bradley-Terry solve.
@@ -62,6 +69,7 @@ import chess.engine
 
 from engine.gameEnv import Chess
 from engine.fen import square_to_alg
+from evaluation.openings import BOOK, apply_opening
 
 DEFAULT_ANCHORS = [
     # a ladder of fixed-strength opponents. Node caps (not movetime) make them
@@ -214,8 +222,18 @@ class _Seat:
 # --------------------------------------------------------------------------- #
 # Game / match (arena.play_game + observation hooks + optional sync check)
 # --------------------------------------------------------------------------- #
-def play_game(white_agent, black_agent, max_plies=300, check_sync=False):
-    """Return white's score (1 / 0.5 / 0). Terminality by the PROJECT env."""
+def play_game(white_agent, black_agent, max_plies=300, check_sync=False,
+              opening=None):
+    """Return white's score (1 / 0.5 / 0). Terminality by the PROJECT env.
+
+    `opening` is a space-separated UCI line from evaluation.openings.BOOK. Both
+    seats start from the SAME resulting position, so it buys game diversity
+    without costing either player strength -- unlike sampling the net's own
+    opening moves at temperature, which is a one-sided handicap when the
+    opponent plays its best move from move one.
+
+    The book plies count toward max_plies (a ~5-ply line out of 300 is noise).
+    """
     white, black = _Seat(white_agent), _Seat(black_agent)
     env = Chess()
     env.reset()
@@ -224,6 +242,14 @@ def play_game(white_agent, black_agent, max_plies=300, check_sync=False):
 
     ref = chess.Board() if check_sync else None
     ply = 0
+    if opening:
+        # apply_opening notifies both seats via .observe(), keeping the UCI
+        # engine's mirror board in sync -- so the engine sees the book line as
+        # real game history and its repetition detection stays correct.
+        ply = apply_opening(env, opening, (white, black))
+        if check_sync:
+            for u in opening.split():
+                ref.push(chess.Move.from_uci(u))
     while ply < max_plies:
         if env.isTerminal():
             break
@@ -255,14 +281,24 @@ def play_game(white_agent, black_agent, max_plies=300, check_sync=False):
 
 
 def match(agent_a, agent_b, games, max_plies=300, check_sync=False,
-          verbose=True, label=""):
+          verbose=True, label="", book=None):
+    """Play `games` games, alternating colours.
+
+    `book`: a list of UCI opening lines (evaluation.openings.BOOK), or None for
+    the bare start position. The line is chosen by `g // 2`, so CONSECUTIVE
+    PAIRS of games share a line and each line is played once with each colour
+    -- a line that happens to favour White then cancels out of the score
+    instead of biasing it. Pass an even `games` for that balance to be exact.
+    """
     wins = draws = losses = 0
     for g in range(games):
         a_white = (g % 2 == 0)
+        line = book[(g // 2) % len(book)] if book else None
         if a_white:
-            s = play_game(agent_a, agent_b, max_plies, check_sync)
+            s = play_game(agent_a, agent_b, max_plies, check_sync, opening=line)
         else:
-            s = 1.0 - play_game(agent_b, agent_a, max_plies, check_sync)
+            s = 1.0 - play_game(agent_b, agent_a, max_plies, check_sync,
+                                opening=line)
         if s == 1.0:
             wins += 1
         elif s == 0.0:
@@ -367,16 +403,24 @@ def discover_checkpoints(ckpt_dir, iters=None):
     return out
 
 
-def make_ckpt_agent(path, sims, c, device_str):
-    """Lazy torch import so anchor-only / fit-only runs need no torch."""
+def make_ckpt_agent(path, sims, c, device_str, opening_plies=0):
+    """Lazy torch import so anchor-only / fit-only runs need no torch.
+
+    opening_plies DEFAULTS TO 0 (was 8, with NeuralAgent's default
+    opening_temp=1.0). Sampling the net's own first eight plies at temperature
+    1 was the only source of game diversity here, but it bought that diversity
+    by making the net play deliberately worse for four moves of every rated
+    game while the UCI opponent played its best move throughout -- so the
+    rating measured a handicapped player. Diversity now comes from the shared
+    opening book instead, which costs neither side anything. Pass
+    opening_plies>0 only to reproduce an old measurement.
+    """
     import torch
     from evaluation.arena import load_net, NeuralAgent
     device = torch.device(device_str if device_str else
                           ("cuda" if torch.cuda.is_available() else "cpu"))
     net = load_net(path, device)
-    # opening_plies>0 gives game diversity (deterministic play would repeat
-    # one game per colour); matches your internal arena's convention.
-    return NeuralAgent(net, iterations=sims, c=c, opening_plies=8)
+    return NeuralAgent(net, iterations=sims, c=c, opening_plies=opening_plies)
 
 
 # --------------------------------------------------------------------------- #
@@ -426,6 +470,14 @@ def main():
                          "default) understates it badly and is not comparable "
                          "across configs.")
     ap.add_argument("--c", type=float, default=1.5)
+    ap.add_argument("--no-book", action="store_true",
+                    help="play every game from the bare start position "
+                         "(only useful for reproducing pre-book numbers)")
+    ap.add_argument("--opening-plies", type=int, default=0,
+                    help="plies the NET samples at temperature for diversity. "
+                         "Leave at 0: this is a one-sided handicap, and the "
+                         "opening book already supplies diversity for free. "
+                         "Set 8 to reproduce the old measurement.")
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--device", default="", help="cuda | cpu (default: auto)")
     ap.add_argument("--matches-file", default=MATCHES_FILE)
@@ -461,8 +513,31 @@ def main():
         raw = re.sub(r"[, ]*(sf:)", r" \1", raw)
         anchor_specs = [canon(s.strip().rstrip(",")) for s in raw.split() if s.strip()]
 
+        book = None if args.no_book else BOOK
+        if book and args.games % 2:
+            print(f"  [warn] --games {args.games} is odd; the last book line "
+                  f"is played with only one colour, so its colour bias does "
+                  f"not cancel. Prefer an even number.")
+        if args.opening_plies:
+            print(f"  [warn] --opening-plies {args.opening_plies}: the net "
+                  f"plays its own opening at temperature 1, which is a "
+                  f"one-sided handicap. Results are not comparable with "
+                  f"opening_plies=0 runs.")
+
+        # Cached pairs are skipped, and results played under the OLD settings
+        # (8 sampled opening plies, no book) are not comparable with these.
+        # Reuse an old matches file only if you know it was produced the same
+        # way -- otherwise point --matches-file at a fresh path.
+        if os.path.exists(args.matches_file) and matches:
+            print(f"  [note] {len(matches)} cached results in "
+                  f"{args.matches_file} will be REUSED. If they predate the "
+                  f"opening book, use a fresh --matches-file instead: the two "
+                  f"measure different things and mixing them corrupts the fit.")
+
         print(f"{len(ckpts)} checkpoints x {len(anchor_specs)} anchors, "
-              f"{args.games} games each  (cached pairs are skipped)")
+              f"{args.games} games each  "
+              f"({'book: ' + str(len(book)) + ' lines' if book else 'no book'}; "
+              f"cached pairs are skipped)")
         for it, path in ckpts:
             name = f"iter{it}"
             agent = None
@@ -474,7 +549,9 @@ def main():
                     continue
                 if agent is None:      # load the net once per checkpoint
                     print(f"  loading {path}")
-                    agent = make_ckpt_agent(path, args.sims, args.c, args.device)
+                    agent = make_ckpt_agent(path, args.sims, args.c,
+                                            args.device,
+                                            opening_plies=args.opening_plies)
                 anchor = UCIAgent(spec, args.engine, name=canon(spec))
                 print(f"  {name} vs {spec}")
                 t0 = time.time()
@@ -482,7 +559,7 @@ def main():
                     w, d, l = match(agent, anchor, args.games,
                                     max_plies=args.max_plies,
                                     check_sync=args.check_sync,
-                                    verbose=True, label=name)
+                                    verbose=True, label=name, book=book)
                 finally:
                     anchor.close()
                 matches[key] = (w, d, l, args.games)
@@ -524,3 +601,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

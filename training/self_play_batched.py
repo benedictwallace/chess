@@ -97,7 +97,7 @@ import numpy as np
 from engine.gameEnv import Chess
 from model.encoding import encode, encode_env
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
-from search.forgiveness import forgiveness_target
+from search.forgiveness import forgiveness_target, select_move_forgiving
 from search.puct import select_move_gumbel   # torch-free to import
 
 
@@ -152,7 +152,8 @@ def select_move(visit_counts, temp=1.0, rng=None):
 
 class Node:
     __slots__ = ("parent", "move", "prior", "children",
-                 "visits", "value", "moverSign", "terminal", "expanded")
+                 "visits", "value", "value_sh", "moverSign", "terminal",
+                 "expanded")
 
     def __init__(self, parent=None, move=None, prior=0.0):
         self.parent = parent
@@ -160,7 +161,8 @@ class Node:
         self.prior = prior
         self.children = []
         self.visits = 0
-        self.value = 0.0
+        self.value = 0.0         # RAW accumulator: targets, stats, selection
+        self.value_sh = 0.0      # SHAPED accumulator: PUCT descent only
         self.moverSign = 0
         self.terminal = False
         self.expanded = False
@@ -189,10 +191,18 @@ def _expand(node, priors, mover, add_noise, is_root,
         _add_dirichlet_noise(node, dirichlet_alpha, noise_frac, rng)
 
 
-def _backprop(path, leaf_value_white):
+def _backprop(path, leaf_value_white, leaf_value_white_sh=None):
+    """Accumulate the RAW leaf value into .value and the SHAPED one into
+    .value_sh (same number when shaping is off / at terminals). The search
+    DESCENDS on .value_sh; every recorded quantity -- policy/value/
+    forgiveness targets, move-selection Qs -- reads .value, so shaping
+    steers visit allocation without corrupting any label."""
+    if leaf_value_white_sh is None:
+        leaf_value_white_sh = leaf_value_white
     for n in path:
         n.visits += 1
         n.value += leaf_value_white * n.moverSign
+        n.value_sh += leaf_value_white_sh * n.moverSign
 
 
 # --------------------------------------------------------------------------- #
@@ -241,11 +251,53 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  fpu_reduction=0.25, value_target_lambda=0.7,
                  record_fast_rows=True,
                  gumbel_select=False, gumbel_c_visit=50.0, gumbel_c_scale=1.0,
+                 forgiving_select=False, forgiving_delta=0.05,
+                 forgiving_stat="gap", forgiving_agg="tree",
+                 forgiving_parity=1,
+                 forgiveness_shaping_beta=0.0,
                  seed=None,
                  verbose=True):
     """
     Play `num_games` games, keeping up to `concurrency` of them running at once
     and batching their leaf evaluations.
+
+    FORGIVENESS-SHAPED SEARCH (forgiveness_shaping_beta > 0): every leaf
+    evaluation backs up
+        v' = clip(v + beta * (2*F_hat - 1), -1, 1)     [mover POV]
+    where F_hat in [0, 1] is the net's own forgiveness-head output on the
+    leaf position -- eval_fn must then return a THIRD array (see
+    _make_torch_eval_fn(return_forgiveness=True)). Centred (2F-1) means
+    forgiving continuations (F > 0.5) are boosted for the player to move
+    there and brittle ones penalised, symmetrically for both players --
+    use a parity-BLENDED head (e.g. flat_entropy) for this. Because the
+    bonus flows through backup, the SEARCH ITSELF prefers forgiving lines,
+    so the visit-count policy targets -- and hence the trained policy --
+    absorb the preference: this is the training-time mechanism, in contrast
+    to post-search selection. Terminal values are never shaped.
+
+    DUAL-TRACK VALUES: the shaped value steers ONLY the PUCT descent
+    (Node.value_sh). Every recorded quantity -- value targets, forgiveness
+    labels, move-selection Qs, root values -- reads the RAW accumulator
+    (Node.value), so the labels the head trains on are statistics of TRUE
+    values rather than of the head's own bonus (no self-referential
+    feedback), and the value targets carry no shaping bias. Shaping reaches
+    the policy exclusively through visit allocation -- exactly the
+    policy-target channel. Use beta ~ typical Q gap (0.02-0.05).
+
+    FORGIVING MOVE SELECTION (forgiving_select, default off): on POST-OPENING
+    (ply >= temp_moves) full-search moves, form the near-optimal set
+        S = { a : Q1 - Q(a) <= forgiving_delta }
+    over the root children that met the forced-visit floor and play the
+    member whose subtree is most forgiving -- search.forgiveness.
+    select_move_forgiving with forgiveness_tau/forgiveness_gamma, statistic
+    forgiving_stat, aggregator forgiving_agg, and forgiving_parity=1 by
+    default ("MY future slack": on a root child the root player's decision
+    nodes sit at odd depths; see the parity section of search/forgiveness).
+    Every move sacrifices at most forgiving_delta of Q versus the greedy
+    choice -- delta is the return-vs-robustness knob, in the same value units
+    as forgiveness_tau. Opening plies keep visit-temperature sampling; fast
+    moves and floor-starved roots fall back to visit selection. Takes
+    precedence over gumbel_select post-opening. Policy targets UNCHANGED.
 
     GUMBEL MOVE SELECTION (gumbel_select, default off): on FULL-SEARCH moves,
     pick the move played by argmax of the Gumbel-AlphaZero score
@@ -434,7 +486,20 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                               forgiveness_t, forgiveness_m))
 
         temp = 1.0 if g.ply < temp_moves else 0.0
-        if gumbel_select and g.is_full_move and g.force_n > 0:
+        move = None
+        if forgiving_select and g.is_full_move and g.force_n > 0 \
+                and temp <= 1e-6:
+            # delta-constrained forgiveness selection over the floored
+            # candidates: play the most forgiving member of
+            # { a : Q1 - Q(a) <= delta }. Falls through to visit selection
+            # when the floor starved the candidate set (returns the Q-best
+            # move itself otherwise, so None only means "no visited child").
+            move = select_move_forgiving(
+                root, forgiving_delta, forgiveness_tau, floor=g.force_n,
+                gamma=forgiveness_gamma, stat=forgiving_stat,
+                agg=forgiving_agg, parity=forgiving_parity)
+        if move is None and gumbel_select and g.is_full_move \
+                and g.force_n > 0:
             # Gumbel-AZ selection: logits + sigma(Q) over the floored
             # candidates; pruned visit counts remain the FALLBACK (and the
             # policy target, untouched above).
@@ -442,7 +507,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 root, temp=temp, rng=rng,
                 c_visit=gumbel_c_visit, c_scale=gumbel_c_scale,
                 min_visits=g.force_n, fallback_counts=visit_counts)
-        else:
+        if move is None:
             move = select_move(visit_counts, temp, rng)
         for ch in root.children:           # remember picked child -> subtree reuse
             if ch.move == move:
@@ -524,19 +589,21 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     # O(children) fallback runs only at roots, whose
                     # moverSign==0 .value is 0/stale under subtree reuse).
                     if node.moverSign != 0:
-                        fpu_q = -(node.value / node.visits) - fpu_reduction
+                        fpu_q = -(node.value_sh / node.visits) - fpu_reduction
                     else:
                         vsum = 0.0
                         nsum = 0
                         for ch in node.children:
                             if ch.visits:
-                                vsum += ch.value
+                                vsum += ch.value_sh
                                 nsum += ch.visits
                         fpu_q = (vsum / nsum - fpu_reduction) if nsum else 0.0
                     best_score = -1e30
                     for ch in node.children:
                         v = ch.visits
-                        q = ch.value / v if v else fpu_q
+                        # descend on the SHAPED Q; .value stays raw for all
+                        # recorded statistics and for move selection
+                        q = ch.value_sh / v if v else fpu_q
                         s = q + c * ch.prior * sqrt_pv / (1 + v)
                         if s > best_score:
                             best_score = s
@@ -577,10 +644,11 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 key = (bkey, env.halfmove_clock, rep)
                 hit = cache.get(key)
                 if hit is not None:
-                    priors, value = hit
+                    priors, value, v_sh = hit
                     _expand(node, priors, mover, add_noise and g.is_full_move,
                             node is g.root, dirichlet_alpha, noise_frac, rng)
-                    _backprop(path, value if mover == "white" else -value)
+                    sgn = 1.0 if mover == "white" else -1.0
+                    _backprop(path, sgn * value, sgn * v_sh)
                     g.sims_done += 1
                     continue
 
@@ -589,18 +657,37 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
 
         # ---- single batched network forward ----
         if batch_planes:
-            logits_b, values_b = eval_fn(batch_planes)
-            for (g, node, env, legal, path, mover, bkey, rep), logits, value in zip(
-                    batch_meta, logits_b, values_b):
+            out = eval_fn(batch_planes)
+            if forgiveness_shaping_beta > 0.0:
+                if len(out) != 3:
+                    raise ValueError(
+                        "forgiveness_shaping_beta > 0 needs an eval_fn that "
+                        "returns (logits, values, forgiveness) -- build it "
+                        "with _make_torch_eval_fn(net, return_forgiveness="
+                        "True)")
+                logits_b, values_b, f_b = out
+                shaped_b = np.clip(
+                    values_b + forgiveness_shaping_beta * (2.0 * f_b - 1.0),
+                    -1.0, 1.0)
+            else:
+                logits_b, values_b = out[0], out[1]
+                shaped_b = values_b
+            for (g, node, env, legal, path, mover, bkey, rep), logits, value, \
+                    v_sh in zip(batch_meta, logits_b, values_b, shaped_b):
                 idxs = [encodeMovePOV(m, mover) for m in legal]
                 probs = _softmax(np.asarray(logits)[idxs])
                 priors = {m: float(p) for m, p in zip(legal, probs)}
                 value = float(value)
+                v_sh = float(v_sh)
                 if cache is not None and len(cache) < cache_cap:
-                    cache[(bkey, env.halfmove_clock, rep)] = (priors, value)
+                    # raw AND shaped cached (beta and the net are fixed for
+                    # the whole call, so hits agree)
+                    cache[(bkey, env.halfmove_clock, rep)] = \
+                        (priors, value, v_sh)
                 _expand(node, priors, mover, add_noise and g.is_full_move,
                         node is g.root, dirichlet_alpha, noise_frac, rng)
-                _backprop(path, value if mover == "white" else -value)
+                sgn = 1.0 if mover == "white" else -1.0
+                _backprop(path, sgn * value, sgn * v_sh)
                 g.sims_done += 1
 
         # ---- games that finished their sims pick a move; refill the pool ----
@@ -637,8 +724,10 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
 # --------------------------------------------------------------------------- #
 # torch evaluator + public entry point
 # --------------------------------------------------------------------------- #
-def _make_torch_eval_fn(net):
-    """Wrap a ChessNet into eval_fn(planes_list) -> (logits[B,A], values[B])."""
+def _make_torch_eval_fn(net, return_forgiveness=False):
+    """Wrap a ChessNet into eval_fn(planes_list) -> (logits[B,A], values[B]),
+    or (logits, values, forgiveness[B]) with return_forgiveness=True -- the
+    form forgiveness-shaped search requires."""
     import torch
     device = next(net.parameters()).device
     use_amp = (device.type == "cuda")
@@ -649,10 +738,18 @@ def _make_torch_eval_fn(net):
         with torch.no_grad():
             if use_amp:
                 with torch.autocast("cuda"):
-                    policy_logits, value = net(x)
+                    out = (net(x, return_forgiveness=True)
+                           if return_forgiveness else net(x))
             else:
-                policy_logits, value = net(x)
+                out = (net(x, return_forgiveness=True)
+                       if return_forgiveness else net(x))
         # .float() so half-precision autocast outputs survive the numpy cast
+        if return_forgiveness:
+            policy_logits, value, f = out
+            return (policy_logits.float().cpu().numpy(),
+                    value.float().cpu().numpy().reshape(-1),
+                    f.float().cpu().numpy().reshape(-1))
+        policy_logits, value = out
         return (policy_logits.float().cpu().numpy(),
                 value.float().cpu().numpy().reshape(-1))
 
@@ -673,6 +770,10 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            record_fast_rows=True,
                            gumbel_select=False, gumbel_c_visit=50.0,
                            gumbel_c_scale=1.0,
+                           forgiving_select=False, forgiving_delta=0.05,
+                           forgiving_stat="gap", forgiving_agg="tree",
+                           forgiving_parity=1,
+                           forgiveness_shaping_beta=0.0,
                            seed=None,
                            verbose=True):
     """
@@ -695,7 +796,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
     """
     if num_games <= 0:
         return []
-    eval_fn = _make_torch_eval_fn(net)
+    eval_fn = _make_torch_eval_fn(
+        net, return_forgiveness=(forgiveness_shaping_beta > 0.0))
     return run_selfplay(
         eval_fn, num_games,
         iterations=iterations, concurrency=concurrency,
@@ -712,6 +814,10 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         record_fast_rows=record_fast_rows,
         gumbel_select=gumbel_select, gumbel_c_visit=gumbel_c_visit,
         gumbel_c_scale=gumbel_c_scale,
+        forgiving_select=forgiving_select, forgiving_delta=forgiving_delta,
+        forgiving_stat=forgiving_stat, forgiving_agg=forgiving_agg,
+        forgiving_parity=forgiving_parity,
+        forgiveness_shaping_beta=forgiveness_shaping_beta,
         seed=seed,
         verbose=verbose,
     )

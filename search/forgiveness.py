@@ -237,6 +237,81 @@ def flat_forgiveness(root, tau, min_kids=2, stat="gap", parity=None):
     return acc / wsum if wsum > 0 else None
 
 
+def flat_forgiveness_hybrid(root, tau, impute_fn, min_kids=2, stat="gap",
+                            parity=None, impute_min_visits=2,
+                            max_impute=32, return_info=False):
+    """flat_forgiveness with HEAD IMPUTATION at the nodes the search left
+    undefined -- the forgiveness analogue of value-bootstrapping leaves.
+
+    Traversal and weighting are identical to flat_forgiveness: every
+    parity-matching node contributes (visits * F). Nodes where the LOCAL
+    statistic is defined contribute it, exactly as before. Nodes where it is
+    UNDEFINED (leaves; nodes with < min_kids visited children) and that
+    carry at least `impute_min_visits` visits are collected, capped to the
+    `max_impute` heaviest by visits, and scored in ONE call to
+
+        impute_fn(list_of_move_paths) -> list of float in [0, 1]
+
+    where each move path is the tuple of Move objects from `root` DOWN to
+    the node (exclusive of the move into `root` itself). The caller owns
+    env-stepping, encoding and the net -- this module stays torch-free.
+
+    WHICH HEAD TO IMPUTE WITH (parity=1, "my slack", the selection case):
+    a parity-1 node is a position where the player who owns the aggregate is
+    TO MOVE, so the imputed value should be that mover's own subtree
+    aggregate -- i.e. a *_me-trained flat head, evaluated in the position's
+    natural (mover) encoding: NO perspective flip, unlike successor scoring.
+    And an aggregate-predicting head is the RIGHT mode here, not the local
+    one: the missing quantity at an unexpanded node is its whole subtree's
+    flat mass, which is precisely what the flat head was trained to output.
+
+    Untouched-truncation caveat: unexplored subtrees hanging below
+    OPPOSITE-parity undefined nodes still contribute nothing (their
+    parity-matching interiors were never enumerated); imputation recovers
+    the frontier, not the unexpanded universe.
+
+    return_info=True -> (F, info) with n_measured / n_imputed node counts
+    and w_measured / w_imputed visit-mass split -- report the imputed mass
+    fraction; a hybrid that is 95% imputation is a head selector in
+    disguise."""
+    acc = wsum = 0.0
+    n_meas = 0
+    w_meas = 0.0
+    pending = []                        # (visits, order, path, node)
+    stack = [(root, 0, ())]
+    while stack:
+        n, depth, path = stack.pop()
+        kids = [c for c in n.children if c.visits > 0]
+        stack.extend((c, depth + 1, path + (c.move,)) for c in kids)
+        if parity is not None and depth % 2 != parity:
+            continue
+        f = node_local_F(n, tau, min_kids, floor=0, stat=stat)
+        if f is not None:
+            acc += n.visits * f
+            wsum += n.visits
+            n_meas += 1
+            w_meas += n.visits
+        elif n.visits >= impute_min_visits and depth > 0:
+            pending.append((n.visits, len(pending), path, n))
+
+    pending.sort(key=lambda t: (-t[0], t[1]))
+    pending = pending[:max_impute]
+    w_imp = 0.0
+    if pending:
+        fs = impute_fn([p for _v, _i, p, _n in pending])
+        for (v, _i, _p, _n), f in zip(pending, fs):
+            if f is not None:
+                acc += v * float(f)
+                wsum += v
+                w_imp += v
+    out = acc / wsum if wsum > 0 else None
+    if not return_info:
+        return out
+    return out, dict(n_measured=n_meas, n_imputed=len(pending),
+                     w_measured=w_meas, w_imputed=w_imp,
+                     imputed_mass=(w_imp / wsum if wsum > 0 else 0.0))
+
+
 # --------------------------------------------------------------------------- #
 # scalar statistics from a Q vector (probe / display convenience)
 # --------------------------------------------------------------------------- #
@@ -260,6 +335,134 @@ def forgiveness_from_qs(qs, tau):
             "F_gap": math.exp(-gap / tau),
             "eff_actions": math.exp(h),
             "forgiveness_entropy": h / math.log(len(q))}
+
+
+# --------------------------------------------------------------------------- #
+# forgiveness-aware move selection (delta-constrained)
+# --------------------------------------------------------------------------- #
+def child_forgiveness(child, tau, gamma=0.85, stat="gap", agg="tree",
+                      parity=1, min_kids=2):
+    """Forgiveness of ONE candidate move = an aggregate over that root
+    child's searched subtree. agg: "tree" (recursive, gamma-decayed) or
+    "flat" (visit-weighted subtree). parity is relative to the CHILD (see
+    the module docstring): the child itself is the OPPONENT's decision node,
+    so parity=1 (default) keeps only the ROOT player's future decision nodes
+    -- "my slack after playing this move"; parity=0 keeps the opponent's
+    decision nodes instead, None the unfiltered blend.
+    Returns F in [0, 1] or None (subtree too thin to say)."""
+    if agg == "tree":
+        return tree_forgiveness(child, gamma, tau, min_kids, stat=stat,
+                                parity=parity)
+    if agg == "flat":
+        return flat_forgiveness(child, tau, min_kids, stat=stat,
+                                parity=parity)
+    raise ValueError(f"unknown forgiveness aggregator {agg!r}")
+
+
+def select_move_forgiving(root, delta, tau, *, floor=0, gamma=0.85,
+                          stat="gap", agg="tree", parity=1, min_kids=2,
+                          score_children=None, return_info=False):
+    """Delta-constrained forgiveness selection at a finished root:
+
+        1. CANDIDATES: children with visits >= floor (floor > 0, i.e. a
+           forced-visit root -- matched-variance Qs) or all visited children
+           (floor == 0). Fewer than 2 candidates -> play the most-visited /
+           only child (nothing to compare).
+        2. NEAR-OPTIMAL SET: S = { a : Q1 - Q(a) <= delta }, chooser-POV,
+           Q1 the best candidate Q. Every member costs at most delta of
+           value per move -- delta IS the return-vs-robustness knob, in the
+           same value units as tau.
+        3. TIE-BREAK BY FORGIVENESS: |S| == 1 -> play the Q-best move.
+           Otherwise play argmax over S of child_forgiveness(...) -- the
+           candidate whose subtree leaves ME the most future slack
+           (parity=1 default); exact F ties break by Q. Members whose
+           subtree F is undefined are dropped; if every member's is, fall
+           back to the Q-best move.
+
+    score_children: optional callable(list_of_child_nodes) -> list of
+    float | None, replacing the default per-child subtree statistic as the
+    forgiveness score of each near-optimal candidate -- the hook for a
+    TRAINED FORGIVENESS HEAD evaluated on the candidates' successor
+    positions (one batched forward over the delta-set). None entries are
+    dropped exactly like undefined subtree statistics.
+
+    return_info=True -> (move, info) with n_qual, n_delta (|S|), q1,
+    q_played, F_played (None if forgiveness never entered), and switched
+    (True when forgiveness overrode the Q-argmax) -- log these: the
+    fraction of switched moves and the realised Q sacrifice are the first
+    numbers a report on this selector needs."""
+    qual = _qualified(root, min_kids, floor)
+    if len(qual) < 2:
+        qual = [c for c in root.children if c.visits > 0]
+    if not qual:
+        return (None, {}) if return_info else None
+    q_of = {id(c): c.value / c.visits for c in qual}
+    best = max(qual, key=lambda c: q_of[id(c)])
+    q1 = q_of[id(best)]
+    info = {"n_qual": len(qual), "q1": q1, "q_played": q1,
+            "F_played": None, "switched": False}
+    if len(qual) < 2:
+        info["n_delta"] = 1
+        return (best.move, info) if return_info else best.move
+
+    S = [c for c in qual if q1 - q_of[id(c)] <= delta]
+    info["n_delta"] = len(S)
+    chosen = best
+    if len(S) > 1:
+        if score_children is not None:
+            fs = score_children(S)
+        else:
+            fs = [child_forgiveness(c, tau, gamma=gamma, stat=stat, agg=agg,
+                                    parity=parity, min_kids=min_kids)
+                  for c in S]
+        scored = [(f, q_of[id(c)], c) for f, c in zip(fs, S) if f is not None]
+        if scored:
+            f_win, q_win, chosen = max(scored, key=lambda t: (t[0], t[1]))
+            info["F_played"] = f_win
+            info["q_played"] = q_win
+            info["switched"] = chosen is not best
+    return (chosen.move, info) if return_info else chosen.move
+
+
+def make_forgiving_decide_move(delta, tau, *, gamma=0.85, stat="gap",
+                               agg="tree", parity=1, floor=0, min_kids=2,
+                               opening_plies=8, opening_temp=1.0,
+                               rng=None, log=None):
+    """decide_move(g, visit_counts) callback for
+    evaluation.score_elo_batched.run_elo_matches_batched (and the
+    robustness arena): during the first `opening_plies` plies it samples by
+    visit counts at `opening_temp` (the callback owns ALL temperature
+    handling, per the runner's contract); afterwards it plays
+    select_move_forgiving(g.root, delta, tau, ...). `log`, if given, is a
+    list that receives each post-opening move's info dict (plus ply and
+    net) -- switched-rate and Q-sacrifice per model come straight off it.
+    NOTE: arena searches carry no forced-visit floor, so floor=0 compares
+    all visited children; pass a positive floor only for roots searched
+    under forcing."""
+    if rng is None:
+        rng = np.random.default_rng()
+
+    def decide(g, visit_counts):
+        if g.ply < opening_plies and opening_temp > 1e-6:
+            moves = list(visit_counts.keys())
+            counts = np.array([visit_counts[m] for m in moves],
+                              dtype=np.float64)
+            if counts.sum() > 0:
+                w = counts ** (1.0 / opening_temp)
+                return moves[rng.choice(len(moves), p=w / w.sum())]
+            return moves[0]
+        move, info = select_move_forgiving(
+            g.root, delta, tau, floor=floor, gamma=gamma, stat=stat,
+            agg=agg, parity=parity, min_kids=min_kids, return_info=True)
+        if log is not None:
+            info["ply"] = g.ply
+            info["net"] = getattr(g, "search_net", None)
+            log.append(info)
+        if move is None:                       # no visited children (should
+            return next(iter(visit_counts))    # not happen -- defensive)
+        return move
+
+    return decide
 
 
 # --------------------------------------------------------------------------- #

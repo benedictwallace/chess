@@ -179,6 +179,23 @@ def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 fpu_reduction=cfg["fpu_reduction"],
                 value_target_lambda=cfg["value_target_lambda"],
                 record_fast_rows=cfg["record_fast_rows"],
+                # --- forwarded so the async actors match main.py's search ---
+                # WITHOUT these the actor uses generate_games_batched's
+                # DEFAULTS (gumbel_select=False, forgiveness_shaping_beta=0.0,
+                # forgiving_select=False): a plain run with no gumbel and no
+                # forgiveness shaping, silently -- no argparse error to catch it.
+                gumbel_select=cfg["gumbel_select"],
+                gumbel_c_visit=cfg["gumbel_c_visit"],
+                gumbel_c_scale=cfg["gumbel_c_scale"],
+                forgiving_select=cfg["forgiving_select"],
+                forgiving_delta=cfg["forgiving_delta"],
+                forgiving_stat=cfg["forgiving_stat"],
+                forgiving_agg=cfg["forgiving_agg"],
+                forgiving_parity=cfg["forgiving_parity"],
+                # start_iter gating cannot be honored here (actors carry no
+                # global iteration counter), so beta is passed directly. Keep
+                # forgiveness_shaping_start_iter=0 for async runs -- guarded in main().
+                forgiveness_shaping_beta=cfg["forgiveness_shaping_beta"],
                 verbose=False)
         except Exception as e:                # e.g. CUDA OOM: back off, stay alive
             print(f"[actor {os.getpid()}] self-play error, backing off: {e}",
@@ -263,6 +280,18 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
     scaler = GradScaler("cuda", enabled=(learner_device.type == "cuda"))
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
+
+    # STAGED SHAPING IS NOT SUPPORTED IN THE ASYNC RUNNER: actors do not know
+    # the learner's global iteration, so beta cannot be gated on it (see the
+    # actor call). A nonzero start_iter would be silently ignored -- shaping
+    # would be live from step 0 regardless. Fail loud instead of lying.
+    if cfg.get("forgiveness_shaping_beta", 0.0) != 0.0 \
+            and cfg.get("forgiveness_shaping_start_iter", 0) > 0:
+        raise ValueError(
+            "forgiveness_shaping_start_iter > 0 cannot be honored by "
+            "main_multigpu (async actors have no global iteration counter). "
+            "Set forgiveness_shaping_start_iter=0 and seed from a mature "
+            "checkpoint, or use the synchronous main.py for staged shaping.")
 
     # spool + control files live in a private temp dir
     run_dir = tempfile.mkdtemp(prefix="azspool_")
@@ -477,4 +506,4 @@ if __name__ == "__main__":
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
 
-    
+        

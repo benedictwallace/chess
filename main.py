@@ -59,9 +59,42 @@ CONFIG = dict(
     # forced floor (root_force_m > 0 or forgiveness_targets=True) to have >= 2
     # matched-variance candidates; otherwise it silently falls back to visit
     # selection. Policy targets are unchanged. Default off = legacy behavior.
-    gumbel_select=False,
+    gumbel_select=True,
     gumbel_c_visit=50.0,       # paper default; prior-vs-Q trust scale offset
     gumbel_c_scale=1.0,        # paper default; overall sigma(Q) gain
+
+    # Delta-constrained FORGIVING move selection (see search/forgiveness.py,
+    # select_move_forgiving): post-opening full-search moves play the most
+    # forgiving member of { a : Q1 - Q(a) <= forgiving_delta } over the
+    # floored candidates -- at most delta of Q sacrificed per move, subtree
+    # forgiveness (forgiveness_tau / forgiveness_gamma; parity=1 = MY future
+    # slack) breaking the near-tie. Needs the forced floor active. delta is
+    # in Q units: at the 66-visit floor the Q1-Q2 difference carries a
+    # standard error of roughly 0.05-0.10, so a delta much below that mostly
+    # selects on noise -- calibrate against probe_forgiveness gap percentiles
+    # and report sensitivity. Takes precedence over gumbel_select.
+    # FORGIVENESS-SHAPED SEARCH (training-time mechanism; see
+    # training/self_play_batched.py): every self-play leaf value backs up
+    #     v' = clip(v + beta * (2*F_hat - 1), -1, 1)
+    # with F_hat the net's own forgiveness head on the leaf position, so the
+    # search -- and therefore the visit-count policy targets -- prefers
+    # forgiving continuations. Both players are shaped symmetrically: seed
+    # the run from a checkpoint whose head was trained on a parity-BLENDED
+    # target (e.g. the offline flat_entropy head). beta is in value units;
+    # keep it ~ the typical Q gap (0.02-0.05). 0.0 = off (legacy).
+    forgiveness_shaping_beta=0.003,
+    # STAGING: shaping only activates once the run reaches this iteration --
+    # head TRAINING can start from iteration 0 (fitting labels is harmless),
+    # but the search should not CONSUME the head until value/policy/labels
+    # are mature. Seeding from an offline-head checkpoint (recommended)
+    # makes 0 fine; for a from-scratch run set this to a few hundred iters.
+    forgiveness_shaping_start_iter=0,
+
+    forgiving_select=False,
+    forgiving_delta=0.05,
+    forgiving_stat="entropy",      # local statistic inside the aggregate
+    forgiving_agg="tree",      # "tree" (gamma-decayed) or "flat"
+    forgiving_parity=1,        # 1 = my future decision nodes (on a root child)
 
     # self-play throughput (see training/self_play_batched.py):
     #  * subtree reuse: after a move, carry the chosen child's already-searched
@@ -135,7 +168,7 @@ CONFIG = dict(
     # ---- forgiveness TARGET generation (now explicit; previously these silently
     # used the defaults inside self_play_batched, so a calibrated tau never
     # reached the actors in the async runner) ----
-    forgiveness_targets=False, # STRENGTH PUSH: off. Forgiveness labels cost
+    forgiveness_targets=True, # STRENGTH PUSH: off. Forgiveness labels cost
                                 # forgiveness_extra_sims per full move (+~12%)
                                 # and, with the forced floor below, divert
                                 # ~half the root budget into equalising the
@@ -155,7 +188,7 @@ CONFIG = dict(
                                 # The same tau serves the entropy statistic.
                                 # FIX for the whole run -- changing it mid-run
                                 # rescales the head's targets under its feet.
-    forgiveness_target_mode="flat_entropy",
+    forgiveness_target_mode="flat_entropy_me",
                                 # visit-weighted normalised Q-entropy over the
                                 # whole search subtree (flat_forgiveness with
                                 # stat="entropy"). WAS "gap" (root-local action
@@ -191,7 +224,7 @@ CONFIG = dict(
                                 # training/train.py so policy gradients are NOT
                                 # diluted by these rows.
 
-    root_force_m=0,             # WAS 6. With forgiveness_targets=False this
+    root_force_m=6,             # WAS 6. With forgiveness_targets=False this
                                 # restores plain PUCT roots (the documented
                                 # combination in self_play_batched): the full
                                 # 700 sims follow PUCT instead of ~400 of them
@@ -216,7 +249,7 @@ CONFIG = dict(
 
     # io
     checkpoint_dir="checkpoints",
-    checkpoint_every=15,
+    checkpoint_every=25,
     metrics_file="metrics.csv",
     resume=True,                # auto-load latest.pt at startup if present
 )
@@ -391,6 +424,14 @@ def main(cfg=CONFIG):
             gumbel_select=cfg["gumbel_select"],
             gumbel_c_visit=cfg["gumbel_c_visit"],
             gumbel_c_scale=cfg["gumbel_c_scale"],
+            forgiving_select=cfg["forgiving_select"],
+            forgiving_delta=cfg["forgiving_delta"],
+            forgiving_stat=cfg["forgiving_stat"],
+            forgiving_agg=cfg["forgiving_agg"],
+            forgiving_parity=cfg["forgiving_parity"],
+            forgiveness_shaping_beta=(
+                cfg["forgiveness_shaping_beta"]
+                if it >= cfg["forgiveness_shaping_start_iter"] else 0.0),
         )
         selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
@@ -453,4 +494,3 @@ def main(cfg=CONFIG):
 if __name__ == "__main__":
     main()
 
-    
