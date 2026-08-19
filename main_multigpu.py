@@ -1,3 +1,11 @@
+# Cython legal-move generation: patches Board.legalMoves in place. MUST be
+# imported before anything that touches engine.board. Each ACTOR process
+# re-imports this module, so the patch applies in every worker, not just the
+# learner. Build with
+#     python setup_movegen.py build_ext --inplace
+# Comment out to fall back to the pure-Python generator.
+import engine.fast_movegen  # noqa: F401
+
 """
 Multi-GPU ASYNC self-play training: self-play actors and the learner run
 CONCURRENTLY instead of alternating.
@@ -24,7 +32,7 @@ memorizes the buffer, publishes overfit weights, the actors generate the next
 chunk with those weights, and progress stalls -- fast early Elo gains, then a
 noisy plateau. Two changes fix this:
 
-  1. `target_ratio` (default 8.0): the learner trains only while
+  1. `target_ratio` (default 12.0): the learner trains only while
          samples_trained_this_run <= target_ratio * samples_generated_this_run
      and otherwise sleeps + drains the spool. Accounting is PER RUN (deltas
      since this process started), so resuming from a large `train_step` with an
@@ -81,7 +89,7 @@ from torch.amp import GradScaler
 from model.network import ChessNet
 from training.self_play_batched import generate_games_batched
 from training.train import ReplayBuffer, train_epoch
-from main import CONFIG, cosine_lr, open_metrics
+from main import CONFIG, cosine_lr, schedule_lr, open_metrics
 
 
 SPOOL_GLOB = "chunk_*.pkl"
@@ -125,6 +133,11 @@ def _atomic_torch_save(obj, path):
 # --------------------------------------------------------------------------- #
 def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 games_per_chunk, max_pending, cfg):
+    # ONE torch thread per actor. An actor's cost is Python move generation,
+    # not tensor math -- its only forward is a small batched GPU pass. Handing
+    # each actor cpu_count//n_actors intra-op threads made sense at 2 actors
+    # per GPU, but the right number of actors is set by CPU CORES (see the
+    # module docstring), and at that count the extra threads only contend.
     torch.set_num_threads(max(1, threads))
     device = _pick_device(gpu_id)
     if device.type == "cuda":
@@ -165,6 +178,7 @@ def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 iterations=cfg["search_iterations"], max_plies=cfg["max_plies"],
                 temp_moves=cfg["temp_moves"], concurrency=cfg["concurrency"],
                 adj_margin=cfg["adj_margin"], adj_plies=cfg["adj_plies"],
+                no_adj_prob=cfg["no_adj_prob"],
                 use_cache=cfg["use_cache"], cache_cap=cfg["cache_cap"],
                 reuse_tree=cfg["reuse_tree"],
                 full_search_prob=cfg["full_search_prob"],
@@ -187,6 +201,10 @@ def _actor_loop(gpu_id, threads, pub_path, spool_dir, stop_path,
                 gumbel_select=cfg["gumbel_select"],
                 gumbel_c_visit=cfg["gumbel_c_visit"],
                 gumbel_c_scale=cfg["gumbel_c_scale"],
+                sequential_halving=cfg.get("sequential_halving", False),
+                sh_m=cfg.get("sh_m", 16),
+                sh_c_visit=cfg.get("sh_c_visit", 50.0),
+                sh_c_scale=cfg.get("sh_c_scale", 0.02),
                 forgiving_select=cfg["forgiving_select"],
                 forgiving_delta=cfg["forgiving_delta"],
                 forgiving_stat=cfg["forgiving_stat"],
@@ -233,7 +251,7 @@ def _drain_spool(spool_dir, buffer):
 def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
          total_train_steps=None, train_block=8, games_per_chunk=None,
          publish_every_steps=None, max_pending_per_actor=3, min_buffer=None,
-         target_ratio=8.0):
+         target_ratio=12.0):
     cfg = dict(CONFIG if cfg is None else cfg)
 
     if gpus is None:
@@ -250,7 +268,10 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     if publish_every_steps is None:
         publish_every_steps = cfg["train_batches"]          # ~once per old "iter"
     if games_per_chunk is None:
-        games_per_chunk = max(1, cfg["concurrency"])        # one full batch-wave
+        # 32, not `concurrency` (128). A chunk is only published when it
+        # COMPLETES, so at 128 the learner receives data in ~20-minute lumps and
+        # the replay-ratio throttle oscillates between starved and saturated.
+        games_per_chunk = max(1, min(32, cfg["concurrency"]))
     if min_buffer is None:
         # WARMUP FLOOR: a quarter of the buffer (150k at the current 600k
         # capacity), not one percent. The old buffer_capacity // 100 (= 2k
@@ -272,12 +293,20 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     # disjoint optimisers -> fully decoupled gradient steps (see train_epoch)
     main_params = [p for n, p in net.named_parameters() if "forgiveness_" not in n]
     forgiveness_params = [p for n, p in net.named_parameters() if "forgiveness_" in n]
-    optimiser = torch.optim.Adam(main_params, lr=cfg["lr"],
-                                 weight_decay=cfg["weight_decay"])
-    forgiveness_optimiser = torch.optim.Adam(forgiveness_params,
-                                      lr=cfg.get("forgiveness_lr", 1e-3),
-                                      weight_decay=cfg["weight_decay"])
-    buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
+    # AdamW: Adam's weight_decay is L2 added to the gradient, which Adam's own
+    # second-moment normalisation then rescales per parameter. AdamW decays the
+    # weights directly, which is what weight_decay=1e-4 is meant to mean.
+    optimiser = torch.optim.AdamW(main_params, lr=cfg["lr"],
+                                  weight_decay=cfg["weight_decay"])
+    forgiveness_optimiser = torch.optim.AdamW(forgiveness_params,
+                                       lr=cfg.get("forgiveness_lr", 1e-3),
+                                       weight_decay=cfg["weight_decay"])
+    # split pools so every batch carries policy_frac policy rows rather than
+    # full_search_prob of them -- see training/train.py
+    buffer = ReplayBuffer(capacity=cfg["buffer_capacity"],
+                          policy_frac=cfg.get("policy_frac", 0.5),
+                          policy_capacity_frac=cfg.get(
+                              "policy_capacity_frac", cfg["full_search_prob"]))
     scaler = GradScaler("cuda", enabled=(learner_device.type == "cuda"))
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
@@ -325,9 +354,14 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     _atomic_torch_save({"model_state": net.state_dict()}, pub_path)  # before actors
 
     # metrics
+    # policy_kl = loss_policy - target_entropy. CE = H(target) + KL, and only
+    # KL is learnable; H(target) is fixed by the search (sims, root Dirichlet
+    # noise, positional ambiguity) at ~1.7 nats. Watch policy_kl, not
+    # loss_policy. See training/train.py.
     header = ["train_step", "iteration", "buffer", "consumed_total",
               "replay_ratio",
-              "loss_total", "loss_policy", "loss_value", "loss_forgiveness",
+              "loss_total", "loss_policy", "policy_kl", "target_entropy",
+              "loss_value", "loss_forgiveness",
               "forgiveness_R2", "forgiveness_tvar",
               "lr", "forgiveness_lr", "wall_sec"]
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
@@ -393,12 +427,16 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                     continue
                 throttle_announced = False
 
-            lr = cosine_lr(step + 1, cfg["lr"], cfg["lr_min"], total_train_steps)
+            # schedule_lr dispatches on cfg["lr_schedule"]; "constant" ignores
+            # total_train_steps entirely, so the run can be stopped or extended
+            # without the LR silently ending up in an annealed tail.
+            lr = schedule_lr(step + 1, cfg["lr"], cfg["lr_min"],
+                             total_train_steps, cfg)
             for grp in optimiser.param_groups:
                 grp["lr"] = lr
-            forgiveness_lr = cosine_lr(step + 1, cfg["forgiveness_lr"],
+            forgiveness_lr = schedule_lr(step + 1, cfg["forgiveness_lr"],
                                 cfg.get("forgiveness_lr_min", cfg["forgiveness_lr"]),
-                                total_train_steps)
+                                total_train_steps, cfg)
             for grp in forgiveness_optimiser.param_groups:
                 grp["lr"] = forgiveness_lr
 
@@ -419,15 +457,20 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                 writer.writerow([step, it, len(buffer), consumed_total,
                                  f"{ratio:.2f}",
                                  f"{losses['total']:.6f}", f"{losses['policy']:.6f}",
+                                 f"{losses['policy_kl']:.6f}",
+                                 f"{losses['target_entropy']:.6f}",
                                  f"{losses['value']:.6f}", f"{losses['forgiveness']:.6f}",
                                  f"{losses['forgiveness_R2']:.4f}", f"{losses['forgiveness_tvar']:.5f}",
                                  f"{lr:.3e}", f"{forgiveness_lr:.3e}",
                                  f"{time.time()-t_start:.1f}"])
                 mf.flush()
-                print(f"  step {step}/{total_train_steps}  buf {len(buffer)}  "
+                _np, _nv = buffer.counts()
+                print(f"  step {step}/{total_train_steps}  "
+                      f"buf {len(buffer)} (P{_np}/V{_nv})  "
                       f"consumed {consumed_total}  ratio {ratio:.1f}  "
                       f"loss {losses['total']:.4f} "
-                      f"(p {losses['policy']:.3f} v {losses['value']:.3f} "
+                      f"(p {losses['policy']:.3f} kl {losses['policy_kl']:.3f} "
+                      f"v {losses['value']:.3f} "
                       f"e {losses['forgiveness']:.3f} R2 {losses['forgiveness_R2']:+.2f})  "
                       f"lr {lr:.2e}",
                       flush=True)
@@ -480,6 +523,10 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Async multi-GPU self-play training")
     ap.add_argument("--actors-per-gpu", type=int, default=2,
+                    # NOTE: size this by CPU CORES, not GPU count. Each actor is
+                    # a Python process bound on move generation (~135 us per
+                    # legalMoves call, 40-45% of actor wall time); the GPU is
+                    # nearly idle. Aim for (physical_cores - 2) / n_gpus.
                     help="self-play processes per GPU (each uses ~one CPU core)")
     ap.add_argument("--gpus", default=None, help="comma-separated ids e.g. 0,1,2,3")
     ap.add_argument("--dedicate-learner-gpu", action="store_true",
@@ -487,11 +534,11 @@ if __name__ == "__main__":
     ap.add_argument("--train-block", type=int, default=8,
                     help="gradient steps per learner round between drains/publishes")
     ap.add_argument("--games-per-chunk", type=int, default=None,
-                    help="games an actor plays per emitted file (default: concurrency; "
+                    help="games an actor plays per emitted file (default: min(32, concurrency); "
                          "smaller values smooth data arrival under the throttle)")
     ap.add_argument("--total-train-steps", type=int, default=None,
                     help="default: loop_iterations * train_batches")
-    ap.add_argument("--target-ratio", type=float, default=8.0,
+    ap.add_argument("--target-ratio", type=float, default=12.0,
                     help="max samples trained per sample generated (per run). "
                          "The learner sleeps when ahead of this. 0 disables "
                          "(old unthrottled behavior). Healthy range ~4-16.")
@@ -506,4 +553,4 @@ if __name__ == "__main__":
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
 
-        
+    

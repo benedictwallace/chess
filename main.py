@@ -1,3 +1,12 @@
+# Cython legal-move generation: patches Board.legalMoves in place. MUST be
+# imported before anything that touches engine.board -- model.network and
+# training.* both pull it in transitively, so this has to be the FIRST project
+# import in the file. Build with
+#     python setup_movegen.py build_ext --inplace
+# and verify with verify_movegen.py + perft_check.py before trusting a run.
+# Comment this line out to fall back to the pure-Python generator.
+import engine.fast_movegen  # noqa: F401
+
 import os
 import csv
 import time
@@ -33,10 +42,17 @@ CONFIG = dict(
                                  # since ~iter 2300 -- and re-decays to lr_min
                                  # by 4800. The ~iter-870 resume showed exactly
                                  # this pattern preceding renewed Elo growth.
-
     # self-play
     games_per_iter=192,
-    search_iterations=700,     # PUCT iterations per move
+    # STRENGTH PUSH: was 700. Self-play is CPU-bound on Python movegen, so cost
+    # per ply is linear in this number while target quality improves ~log(N).
+    # With full_search_prob=0.5 the budget per POLICY ROW goes 1100 -> 500
+    # sims, i.e. ~2.2x more policy targets for the same wall-clock. A 400-sim
+    # target from a net at this strength is only marginally softer than an
+    # 800-sim one -- the limiting factor is the priors, not search depth.
+    # Raise toward 600-800 once the net is past ~1600 and data is no longer
+    # the binding constraint. Keep --sims in the gauntlet equal to this.
+    search_iterations=1000,     # PUCT iterations per move
     max_plies=300,             # hard ply cap. WAS 100 -- far too low: 100 plies
                                # is 50 moves, so every game not won by the
                                # adjudication margin within 50 moves was
@@ -59,7 +75,16 @@ CONFIG = dict(
     # forced floor (root_force_m > 0 or forgiveness_targets=True) to have >= 2
     # matched-variance candidates; otherwise it silently falls back to visit
     # selection. Policy targets are unchanged. Default off = legacy behavior.
-    gumbel_select=True,
+    # STRENGTH PUSH: was True. select_move_gumbel scores are
+    # log prior + (c_visit + max_N) * c_scale * Q, and max_N at a full budget
+    # makes that sigma factor several hundred -- so a Q gap of 0.05 becomes
+    # 20-30 logits and softmax(scores/temp) at temp=1 is numerically an ARGMAX.
+    # The opening plies whose entire purpose is diversity were being played
+    # deterministically, and every game in a batch opened alike. self_play_
+    # batched now routes temp>0 plies through visit-count sampling regardless,
+    # so this flag only affects post-opening moves -- but for a clean AlphaZero
+    # baseline leave it off. (It also cannot fire at all while root_force_m=0.)
+    gumbel_select=False,
     gumbel_c_visit=50.0,       # paper default; prior-vs-Q trust scale offset
     gumbel_c_scale=1.0,        # paper default; overall sigma(Q) gain
 
@@ -82,7 +107,13 @@ CONFIG = dict(
     # the run from a checkpoint whose head was trained on a parity-BLENDED
     # target (e.g. the offline flat_entropy head). beta is in value units;
     # keep it ~ the typical Q gap (0.02-0.05). 0.0 = off (legacy).
-    forgiveness_shaping_beta=0.003,
+    # BASELINE / CONTROL ARM: was 0.003. Any nonzero beta means PUCT descends
+    # on shaped values (Node.value_sh), so the search -- and the visit-count
+    # policy targets it produces -- are no longer a plain-AlphaZero control.
+    # 0.003 was in any case an order of magnitude below the typical Q gap it
+    # was meant to break, so it cost a 3-output forward for no effect. When you
+    # run the treatment arm, use 0.02-0.05 per the docstring.
+    forgiveness_shaping_beta=0.0,
     # STAGING: shaping only activates once the run reaches this iteration --
     # head TRAINING can start from iteration 0 (fitting labels is harmless),
     # but the search should not CONSUME the head until value/policy/labels
@@ -92,7 +123,7 @@ CONFIG = dict(
 
     forgiving_select=False,
     forgiving_delta=0.05,
-    forgiving_stat="entropy",      # local statistic inside the aggregate
+    forgiving_stat="gap",      # local statistic inside the aggregate
     forgiving_agg="tree",      # "tree" (gamma-decayed) or "flat"
     forgiving_parity=1,        # 1 = my future decision nodes (on a root child)
 
@@ -106,7 +137,12 @@ CONFIG = dict(
     #    self-play compute per game. Tune the fraction/budget and watch strength;
     #    set full_search_prob=1.0 to disable (i.e. train on every move as before).
     reuse_tree=True,
-    full_search_prob=0.25,
+    # STRENGTH PUSH: was 0.25. Halving search_iterations pays for doubling the
+    # fraction of plies that produce a policy target, at roughly constant cost
+    # per ply (0.5*400 + 0.5*100 = 250 vs 0.25*700 + 0.75*100 = 250).
+    # Also makes policy and value-only rows arrive at equal rates, which is
+    # what keeps the two replay pools' time-horizons aligned (see policy_frac).
+    full_search_prob=0.5,
     fast_search_iterations=100,
 
     # batched self-play. Games are played in one process and their MCTS leaf
@@ -135,8 +171,20 @@ CONFIG = dict(
     # bootstraps their value target from the last full-search root value. See
     # finalize() in training/self_play_batched.py.
     adj_margin=5.0,            # 5 == 'up a rook'
-    adj_plies=20,              # consecutive plies the lead must hold
-
+    # consecutive plies the lead must hold
+    adj_plies=20,
+    no_adj_prob=0.1,           # fraction of games that IGNORE adjudication and
+                               # play to a real terminal position. If every
+                               # decided game stops the moment one side is up a
+                               # rook, the value head never sees a conversion or
+                               # a mate and learns "up a rook => +1" as a
+                               # shortcut, while the policy never learns mating
+                               # technique at all -- and in the gauntlet, where
+                               # play_game adjudicates at ply 300 on the same
+                               # >=5 rule, every won-a-knight game you cannot
+                               # convert scores 0.5 instead of 1.0. AlphaGo Zero
+                               # disabled resignation in 10% of games for
+                               # exactly this reason. Costs ~10% self-play.              # consecutive plies the lead must hold
     # training
     buffer_capacity=600_000,   # WAS 200k. record_fast_rows grows rows/game ~4x
                                # (value-only rows from playout-capped moves), so
@@ -156,7 +204,29 @@ CONFIG = dict(
                                # lifts lr ~5.5x. If value loss still creeps,
                                # raise games_per_iter before cutting further.
     batch_size=256,
-    lr=1e-3,
+    policy_frac=0.5,           # share of every training batch drawn from the
+                               # POLICY pool (see training/train.py). With
+                               # record_fast_rows most rows are value-only, so a
+                               # uniform buffer estimates the policy gradient
+                               # from only full_search_prob * batch_size rows --
+                               # not scaled down (train_epoch mask-normalises)
+                               # but ~2x noisier than the batch size implies.
+    policy_capacity_frac=0.5,  # share of buffer CAPACITY given to the policy
+                               # pool. Each pool holds its own most-recent rows,
+                               # so to give both the same time-horizon this
+                               # should track full_search_prob.
+    lr_schedule="constant",    # "constant" | "cosine". See schedule_lr().
+                               # constant: lr is used verbatim, no horizon to
+                               # guess, safe to stop/extend a run at any time.
+                               # cosine: the old behaviour -- use it only for a
+                               # short, deliberate final anneal.
+    lr=4e-4,                   # was 1e-3 as a COSINE PEAK, which is not the
+                               # same thing as a constant rate. 4e-4 is near the
+                               # value the two successful warm restarts actually
+                               # trained at (~5.5e-4 decaying), and is a sane
+                               # constant. Raise toward 6e-4 if loss is stable
+                               # and progress is slow; drop to 2e-4 if policy_kl
+                               # becomes noisy or spikes.
     lr_min=1e-4,                # cosine-decay floor; LR goes lr -> lr_min over the run
     weight_decay=1e-4,
     forgiveness_lr=1e-3,               # forgiveness head's OWN optimiser, cosine-decayed
@@ -168,18 +238,15 @@ CONFIG = dict(
     # ---- forgiveness TARGET generation (now explicit; previously these silently
     # used the defaults inside self_play_batched, so a calibrated tau never
     # reached the actors in the async runner) ----
-    forgiveness_targets=True, # STRENGTH PUSH: off. Forgiveness labels cost
-                                # forgiveness_extra_sims per full move (+~12%)
-                                # and, with the forced floor below, divert
-                                # ~half the root budget into equalising the
-                                # top-m children instead of deepening the PV.
-                                # The head's weights stay in the net untouched
-                                # (train_epoch skips the aux path; metrics log
-                                # zeros in the forgiveness columns). Labels for
-                                # head training are generated OFFLINE from any
-                                # checkpoint via train_forgiveness_heads.py --
-                                # nothing about this run consumes them, so
-                                # paying for them per-iteration buys nothing.
+    # BASELINE / CONTROL ARM: was True. This is the SECOND shaping channel and
+    # the easy one to miss: it extends full_cap by forgiveness_extra_sims AND
+    # widens the forced floor via full_force_m = max(root_force_m,
+    # forgiveness_force_m), so it changes how the search ALLOCATES visits even
+    # though its stated job is label collection. Labels are generated offline
+    # from any checkpoint by train_forgiveness_heads.py, which is also the
+    # cleaner experimental design: the control's search was never touched.
+    # With this False, train_epoch's aux_forgiveness path is off too.
+    forgiveness_targets=False,
     forgiveness_tau=0.044,             # probe_forgiveness calibration: median(gap)/ln 2.
                                 # Recalibrated 2026-07 from a 300-position
                                 # probe of the iter800 (128x8, FPU) net:
@@ -223,17 +290,16 @@ CONFIG = dict(
                                 # The policy loss is mask-normalized in
                                 # training/train.py so policy gradients are NOT
                                 # diluted by these rows.
+    # BASELINE: was 6. Restores plain PUCT roots. With forgiveness_targets on
 
-    root_force_m=6,             # WAS 6. With forgiveness_targets=False this
-                                # restores plain PUCT roots (the documented
-                                # combination in self_play_batched): the full
-                                # 700 sims follow PUCT instead of ~400 of them
-                                # being pinned to a per-child floor. Forced
-                                # visits were already pruned from policy
-                                # targets, so the floor's only remaining
-                                # effect was weaker move selection + noisier
-                                # root values. Restore 6 when forgiveness
-                                # label generation is switched back on.
+    # and this at 6 the floor was min(80, 800//12) = 66 visits x 6 children =
+    # 396 of 800 sims (49.5%) pinned to equalising the top-m children instead
+
+    # of deepening the PV. Setting this to 0 also makes force_n 0, which is the
+    # gate on BOTH gumbel_select and forgiving_select -- so neither can fire
+
+    # even if left enabled. Restore 6 for the treatment arm.
+    root_force_m=0,
     root_force_visits=80,       # per-child visit floor CEILING. Effective
                                 # floor = min(this, cap // (2*m)) with
                                 # cap = search_iterations + forgiveness_extra_sims:
@@ -246,6 +312,31 @@ CONFIG = dict(
                                 # at this tau/floor; raise forgiveness_extra_sims
                                 # (960 lifts the floor to the full 80) before
                                 # blaming the head.
+    # ---- GUMBEL SEQUENTIAL HALVING (see search/sequential_halving.py) ----
+    # Replaces THREE root mechanisms at once on full-search moves: Dirichlet
+    # noise -> Gumbel top-m sampling, forced root visits -> sequential halving,
+    # visit-count policy target -> pi' = softmax(logit + sigma(completed-Q)).
+    # They are a package; enabling this auto-disables root forcing and root
+    # noise (announced at startup) because leaving either on would silently
+    # corrupt the target rather than fail.
+    sequential_halving=True,
+    sh_m=16,                    # root actions sampled per move. The budget is
+                                # spent over ceil(log2(m)) phases, halving the
+                                # candidate set each time; with 1000 sims and
+                                # m=16 the two finalists end on ~240 visits
+                                # each with MATCHED standard errors -- the
+                                # property root_force_m existed to buy, now
+                                # obtained without pinning half the budget.
+    sh_c_visit=50.0,            # paper default; prior-vs-Q trust offset
+    sh_c_scale=0.02,            # TARGET SHARPNESS. Do not use the paper's 1.0:
+                                # sharpness is set by (c_visit + max_N)*c_scale
+                                # and halving drives max_N to ~240, so 1.0
+                                # yields a ONE-HOT target (measured 0.000 nats)
+                                # and mctx's 0.1 gives ~0.15 nats. 0.02 lands
+                                # at ~1.8-2.2 nats, matching the visit-count
+                                # target_entropy this policy head is already
+                                # trained against. Falls as the sim budget
+                                # rises -- see the table in the module docstring.
 
     # io
     checkpoint_dir="checkpoints",
@@ -287,6 +378,44 @@ def cosine_lr(it, base_lr, lr_min, total):
     return lr_min + 0.5 * (base_lr - lr_min) * (1.0 + math.cos(math.pi * t))
 
 
+def schedule_lr(it, base_lr, lr_min, total, cfg=None):
+    """LR for step/iteration `it`. Dispatches on cfg["lr_schedule"].
+
+    "constant"  -> base_lr, always. `total` is ignored.
+    "cosine"    -> cosine_lr (the previous behaviour).
+
+    WHY CONSTANT IS THE DEFAULT NOW
+    -------------------------------
+    cosine_lr is a pure function of it/total, which makes it exactly correct
+    across resumes -- but it also means the LR you actually train at is decided
+    by a number you have to guess in advance, and guessing it wrong is silent.
+    Set `total` too low relative to where you resume and the whole run happens
+    in the annealed tail.
+
+    On this project that failure mode cost two multi-day runs. The two
+    transitions that gained Elo (+236 and +255 head-to-head) both began at
+    ~5.5e-4 after a horizon extension; the two that gained nothing (-19 and +4,
+    both inside measurement noise) ran entirely at <=1.9e-4 because the resume
+    point sat at 80-90% of the configured horizon.
+
+    A constant LR removes the guess. Nothing depends on a planned run length,
+    so a run can be stopped or extended freely and every step is spent at a
+    productive LR. This is close to how KataGo and Leela actually train: a long
+    body at essentially fixed LR, with decay only at the very end.
+
+    You still want that final decay -- it is worth real Elo. Do it DELIBERATELY,
+    as a short separate run once you have decided to stop: set
+    lr_schedule="cosine" and total_train_steps a little beyond the current step,
+    so the anneal is short and lands where you intended.
+    """
+    mode = (cfg or {}).get("lr_schedule", "constant")
+    if mode == "constant":
+        return base_lr
+    if mode == "cosine":
+        return cosine_lr(it, base_lr, lr_min, total)
+    raise ValueError(f"unknown lr_schedule {mode!r}: use 'constant' or 'cosine'")
+
+
 def main(cfg=CONFIG):
     """
     Run the self-play -> train -> checkpoint loop, logging losses per
@@ -315,14 +444,27 @@ def main(cfg=CONFIG):
     # fully decoupled -- neither optimiser can ever move the other's params.
     main_params = [p for n, p in net.named_parameters() if "forgiveness_" not in n]
     forgiveness_params = [p for n, p in net.named_parameters() if "forgiveness_" in n]
-    optimiser = torch.optim.Adam(
+    # AdamW, not Adam. torch.optim.Adam implements weight_decay as L2 ADDED TO
+    # THE GRADIENT, which Adam's per-parameter second-moment normalisation then
+    # rescales -- so the effective decay on a parameter depends on its gradient
+    # history, and large-gradient parameters (the BN-adjacent conv weights) are
+    # decayed least. AdamW applies the decay directly to the weights, which is
+    # what "weight_decay=1e-4" is meant to mean.
+    optimiser = torch.optim.AdamW(
         main_params, lr=cfg["lr"], weight_decay=cfg["weight_decay"]
     )
-    forgiveness_optimiser = torch.optim.Adam(
+    forgiveness_optimiser = torch.optim.AdamW(
         forgiveness_params, lr=cfg.get("forgiveness_lr", 1e-3),
         weight_decay=cfg["weight_decay"]
     )
-    buffer = ReplayBuffer(capacity=cfg["buffer_capacity"])
+    # policy_frac: share of every batch drawn from the POLICY pool. See
+    # training/train.py -- with record_fast_rows most rows are value-only, so a
+    # uniform buffer estimates the policy gradient from only
+    # full_search_prob * batch_size rows.
+    buffer = ReplayBuffer(capacity=cfg["buffer_capacity"],
+                          policy_frac=cfg.get("policy_frac", 0.5),
+                          policy_capacity_frac=cfg.get(
+                              "policy_capacity_frac", cfg["full_search_prob"]))
 
     # One persistent AMP loss scaler for the whole run. Recreating it each
     # iteration would reset the online loss-scale calibration and re-run its
@@ -375,8 +517,13 @@ def main(cfg=CONFIG):
     # ---- metrics log: write a header once, then append a row per iteration.
     # If an existing file has a different (older) header, divert to a fresh
     # _v2 file instead of appending misaligned rows. ----
+    # policy_kl / target_entropy: CE = H(target) + KL(target||pred), and only
+    # KL is learnable. Track policy_kl -- loss_policy alone conflates real
+    # progress with a search-determined floor of ~1.7 nats and makes a learning
+    # run look like a plateau. See training/train.py.
     header = ["iteration", "buffer_size",
-              "loss_total", "loss_policy", "loss_value", "loss_forgiveness",
+              "loss_total", "loss_policy", "policy_kl", "target_entropy",
+              "loss_value", "loss_forgiveness",
               "forgiveness_R2", "forgiveness_tvar",
               "selfplay_sec", "train_sec"]
     metrics_path = os.path.join(cfg["checkpoint_dir"], cfg["metrics_file"])
@@ -387,11 +534,13 @@ def main(cfg=CONFIG):
         print(f"\n ===== Loop iteration {it}/{n_iters} =====")
 
         # cosine-decay the learning rate (lr -> lr_min over the planned run)
-        lr = cosine_lr(it, cfg["lr"], cfg["lr_min"], cfg["loop_iterations"])
+        lr = schedule_lr(it, cfg["lr"], cfg["lr_min"],
+                         cfg["loop_iterations"], cfg)
         for grp in optimiser.param_groups:
             grp["lr"] = lr
-        forgiveness_lr = cosine_lr(it, cfg["forgiveness_lr"], cfg.get("forgiveness_lr_min", cfg["forgiveness_lr"]),
-                            cfg["loop_iterations"])
+        forgiveness_lr = schedule_lr(it, cfg["forgiveness_lr"],
+                            cfg.get("forgiveness_lr_min", cfg["forgiveness_lr"]),
+                            cfg["loop_iterations"], cfg)
         for grp in forgiveness_optimiser.param_groups:
             grp["lr"] = forgiveness_lr
         print(f"  lr {lr:.2e}  forgiveness_lr {forgiveness_lr:.2e}")
@@ -406,6 +555,7 @@ def main(cfg=CONFIG):
             concurrency=cfg["concurrency"],
             adj_margin=cfg["adj_margin"],
             adj_plies=cfg["adj_plies"],
+            no_adj_prob=cfg["no_adj_prob"],
             use_cache=cfg["use_cache"],
             cache_cap=cfg["cache_cap"],
             reuse_tree=cfg["reuse_tree"],
@@ -424,6 +574,10 @@ def main(cfg=CONFIG):
             gumbel_select=cfg["gumbel_select"],
             gumbel_c_visit=cfg["gumbel_c_visit"],
             gumbel_c_scale=cfg["gumbel_c_scale"],
+            sequential_halving=cfg.get("sequential_halving", False),
+            sh_m=cfg.get("sh_m", 16),
+            sh_c_visit=cfg.get("sh_c_visit", 50.0),
+            sh_c_scale=cfg.get("sh_c_scale", 0.02),
             forgiving_select=cfg["forgiving_select"],
             forgiving_delta=cfg["forgiving_delta"],
             forgiving_stat=cfg["forgiving_stat"],
@@ -435,7 +589,9 @@ def main(cfg=CONFIG):
         )
         selfplay_sec = time.time() - t0
         buffer.add_examples(examples)
-        print(f"  buffer size: {len(buffer)}  (self-play {selfplay_sec:.1f}s)")
+        _np, _nv = buffer.counts()
+        print(f"  buffer size: {len(buffer)}  "
+              f"(policy {_np}, value-only {_nv}; self-play {selfplay_sec:.1f}s)")
 
         print("training")
         t0 = time.time()
@@ -458,7 +614,9 @@ def main(cfg=CONFIG):
         # ---- log this iteration's metrics ----
         writer.writerow([
             it, len(buffer),
-            f"{losses['total']:.6f}", f"{losses['policy']:.6f}", f"{losses['value']:.6f}",
+            f"{losses['total']:.6f}", f"{losses['policy']:.6f}",
+            f"{losses['policy_kl']:.6f}", f"{losses['target_entropy']:.6f}",
+            f"{losses['value']:.6f}",
             f"{losses['forgiveness']:.6f}",
             f"{losses['forgiveness_R2']:.4f}", f"{losses['forgiveness_tvar']:.5f}",
             f"{selfplay_sec:.2f}", f"{train_sec:.2f}",

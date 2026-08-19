@@ -1,6 +1,35 @@
 """
 Single-process, leaf-batched self-play.
 
+REVISION NOTES (differences from the previous version of this file)
+-------------------------------------------------------------------
+Behaviour changes:
+  * OPENING PLIES SAMPLE VISIT COUNTS AGAIN. Gumbel and forgiving move
+    selection now apply only at temp == 0 (post-opening). See do_move.
+  * NO-ADJUDICATION GAMES (no_adj_prob, default 0.1): a fraction of games
+    ignore early material adjudication and play to a real terminal position,
+    so the value head sees conversions and mates instead of only "up a rook".
+    Set no_adj_prob=0.0 to restore the old behaviour exactly.
+
+Throughput changes (no effect on what is recorded):
+  * The leaf block does all its CHEAP work before generating moves. The old
+    order called env.legalMoves() (~135 us, ~40-45% of self-play wall time)
+    and then threw the result away on every evaluation-cache hit.
+  * A legal-move cache keyed on stateKey() alone. Legality is a pure function
+    of the state key -- which already carries side-to-move, castling rights and
+    the ep square -- and is INDEPENDENT of the halfmove clock and repetition
+    count, so it hits far more often than the eval cache (which must key on all
+    three). It also stores the POV action indices, removing a per-legal-move
+    encodeMovePOV call at every leaf evaluation.
+  * A leaf with no legal moves is scored by ONE inCheck() call. env.result()
+    ran checkMate() AND staleMate(), each regenerating the full move list.
+  * _expand builds its child list in a single comprehension with positional
+    args and moverSign set in Node.__init__.
+
+Together these measured ~1.23x per leaf evaluation. They pair with the
+drop-in engine/moves.py and model/move_encoding.py replacements; none of them
+changes the legal-move SET, the policy targets, or the value targets.
+
 This replaces the per-eval cross-process round trip in self_play_parallel.py.
 The old design had each worker block on its pipe after submitting ONE position,
 so at most `workers` evaluations were ever in flight and the GPU saw batches of
@@ -99,6 +128,7 @@ from model.encoding import encode, encode_env
 from model.move_encoding import encodeMovePOV, NUM_ACTIONS
 from search.forgiveness import forgiveness_target, select_move_forgiving
 from search.puct import select_move_gumbel   # torch-free to import
+from search.sequential_halving import SHState, improved_policy
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +160,26 @@ def _policy_target_sparse(visit_counts, sideToMove):
     return idx, pr
 
 
+def _policy_target_from_probs(probs, sideToMove):
+    """Sparse (indices, probs) from a {Move: probability} dict -- the storage
+    format _policy_target_sparse produces, but for a target that is already a
+    distribution rather than a visit histogram. Entries below 1e-6 are dropped
+    (pi' gives every legal move nonzero mass, and a 40-wide row should not
+    become a 200-wide one over numerical dust); the remainder is renormalised."""
+    if not probs:
+        return _EMPTY_POLICY
+    items = [(m, p) for m, p in probs.items() if p > 1e-6]
+    if not items:
+        return _EMPTY_POLICY
+    tot = sum(p for _, p in items)
+    idx = np.empty(len(items), dtype=np.int32)
+    pr = np.empty(len(items), dtype=np.float32)
+    for i, (move, p) in enumerate(items):
+        idx[i] = encodeMovePOV(move, sideToMove)
+        pr[i] = p / tot
+    return idx, pr
+
+
 def _position_value_white(root, mover_sign):
     tot = sum(c.visits for c in root.children if c.visits > 0)
     if tot == 0:
@@ -153,9 +203,9 @@ def select_move(visit_counts, temp=1.0, rng=None):
 class Node:
     __slots__ = ("parent", "move", "prior", "children",
                  "visits", "value", "value_sh", "moverSign", "terminal",
-                 "expanded")
+                 "expanded", "net_value")
 
-    def __init__(self, parent=None, move=None, prior=0.0):
+    def __init__(self, parent=None, move=None, prior=0.0, moverSign=0):
         self.parent = parent
         self.move = move
         self.prior = prior
@@ -163,9 +213,13 @@ class Node:
         self.visits = 0
         self.value = 0.0         # RAW accumulator: targets, stats, selection
         self.value_sh = 0.0      # SHAPED accumulator: PUCT descent only
-        self.moverSign = 0
+        self.moverSign = moverSign
         self.terminal = False
         self.expanded = False
+        # RAW network value of THIS position in ITS OWN mover's POV, stored at
+        # expansion. Roots carry moverSign == 0 so their .value accumulator
+        # stays 0 and cannot supply v(s) for the Gumbel v_mix -- hence this.
+        self.net_value = None
 
 
 def _add_dirichlet_noise(root, alpha, frac, rng=None):
@@ -179,13 +233,18 @@ def _add_dirichlet_noise(root, alpha, frac, rng=None):
 
 
 def _expand(node, priors, mover, add_noise, is_root,
-            dirichlet_alpha, noise_frac, rng=None):
-    """Attach children to `node` from a {Move: prior} dict."""
+            dirichlet_alpha, noise_frac, rng=None, net_value=None):
+    """Attach children to `node` from a {Move: prior} dict.
+
+    net_value: the raw network value of this position in the mover's POV.
+    Needed at roots for the Gumbel v_mix (see search/sequential_halving.py).
+    """
     sign = 1 if mover == "white" else -1
-    for m, p in priors.items():
-        child = Node(parent=node, move=m, prior=p)
-        child.moverSign = sign
-        node.children.append(child)
+    node.net_value = net_value
+    # one comprehension, positional args, moverSign set in __init__: this loop
+    # runs ~3M times per profiling window and was the single largest tottime
+    # entry in the self-play profile.
+    node.children = [Node(node, m, p, sign) for m, p in priors.items()]
     node.expanded = True
     if add_noise and is_root:
         _add_dirichlet_noise(node, dirichlet_alpha, noise_frac, rng)
@@ -212,9 +271,14 @@ class _GameState:
     __slots__ = ("env", "root", "ply", "adj_streak", "early_result",
                  "sims_done", "done", "history",
                  "move_cap", "is_full_move", "chosen",
-                 "force_m", "force_n", "forced_set", "forced_counts")
+                 "force_m", "force_n", "forced_set", "forced_counts",
+                 "no_adj", "sh")
 
-    def __init__(self):
+    def __init__(self, no_adj=False):
+        # no_adj: this game IGNORES early material adjudication and plays on to
+        # a real terminal position (or the ply cap). See no_adj_prob in
+        # run_selfplay -- AlphaGo Zero's "resignation disabled" games.
+        self.no_adj = no_adj
         self.env = Chess()
         self.env.reset()
         self.root = Node()
@@ -234,6 +298,8 @@ class _GameState:
         self.forced_set = None    # top-m root children by prior (computed lazily
                                   # after root expansion, i.e. post-noise)
         self.forced_counts = {}   # Move -> visits given by forcing this move
+        self.sh = None            # SHState for this move (sequential halving),
+                                  # built lazily once the root has children
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +308,7 @@ class _GameState:
 def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  max_plies=200, temp_moves=30, c=1.5,
                  add_noise=True, dirichlet_alpha=0.3, noise_frac=0.25,
-                 adj_margin=5.0, adj_plies=20,
+                 adj_margin=5.0, adj_plies=20, no_adj_prob=0.1,
                  use_cache=True, cache_cap=200_000,
                  reuse_tree=True, full_search_prob=1.0, fast_iterations=None,
                  root_force_m=6, root_force_visits=80,
@@ -251,6 +317,8 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                  fpu_reduction=0.25, value_target_lambda=0.7,
                  record_fast_rows=True,
                  gumbel_select=False, gumbel_c_visit=50.0, gumbel_c_scale=1.0,
+                 sequential_halving=False, sh_m=16,
+                 sh_c_visit=50.0, sh_c_scale=0.02,
                  forgiving_select=False, forgiving_delta=0.05,
                  forgiving_stat="gap", forgiving_agg="tree",
                  forgiving_parity=1,
@@ -299,13 +367,20 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     moves and floor-starved roots fall back to visit selection. Takes
     precedence over gumbel_select post-opening. Policy targets UNCHANGED.
 
-    GUMBEL MOVE SELECTION (gumbel_select, default off): on FULL-SEARCH moves,
-    pick the move played by argmax of the Gumbel-AlphaZero score
+    GUMBEL MOVE SELECTION (gumbel_select, default off): on POST-OPENING
+    (ply >= temp_moves) FULL-SEARCH moves, pick the move played by argmax of
+    the Gumbel-AlphaZero score
         log prior + (gumbel_c_visit + max_visits) * gumbel_c_scale * Q
     over the root children that met the forced-visit floor (see
-    search.puct.select_move_gumbel), instead of argmax pruned visits; during
-    the temp_moves opening the same scores are SAMPLED at the usual
-    temperature. This decides on prior-regularised Q values -- a late Q-flip
+    search.puct.select_move_gumbel), instead of argmax pruned visits.
+
+    CHANGED: the opening plies are NO LONGER routed through these scores. The
+    sigma factor (gumbel_c_visit + max_visits) is several hundred at a full
+    budget, so sampling softmax(scores / temp) at temp=1 is numerically an
+    argmax -- the plies whose whole purpose is opening diversity were played
+    deterministically. Opening plies now sample the pruned VISIT COUNTS at
+    temperature, as they did before gumbel_select existed. This decides on
+    prior-regularised Q values -- a late Q-flip
     the visit counts have not caught up with gets played -- and it is sound
     here precisely because the forced floor gives the candidates
     matched-variance Qs. Fast (playout-capped) moves have no floor and junk
@@ -313,6 +388,16 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     UNCHANGED (still pruned visit counts): this flag changes which move is
     played, not what is recorded. If fewer than two children met the floor
     (e.g. root_force_m=0), selection falls back to pruned-visit selection.
+
+    NO-ADJUDICATION GAMES (no_adj_prob, default 0.1): each game independently
+    draws a flag; flagged games ignore the adj_margin/adj_plies early stop and
+    play on to a real terminal position or the ply cap. Early adjudication
+    removes the biggest self-play cost, but if EVERY decided game is cut the
+    moment one side is up a rook, the value head never observes a conversion or
+    a mate and learns "up a rook => +1" as a shortcut; the policy never learns
+    mating technique at all. AlphaGo Zero disabled resignation in 10% of games
+    for exactly this reason. Costs ~10% more self-play. 0.0 restores the old
+    always-adjudicate behaviour.
 
     seed: seeds ONE np.random.Generator that drives every random draw in this
     call (playout-cap coin flips, Dirichlet noise, temperature sampling), so a
@@ -376,6 +461,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     """
     concurrency = max(1, min(concurrency, num_games))
     cache = {} if use_cache else None
+    lm_cache = {} if use_cache else None   # stateKey -> legal move list
 
     full_cap = iterations + (int(forgiveness_extra_sims) if forgiveness_targets else 0)
     fast_cap = iterations if fast_iterations is None else max(1, int(fast_iterations))
@@ -383,9 +469,26 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     root_force_m = max(0, int(root_force_m))
     full_force_m = max(root_force_m, int(forgiveness_force_m)) if forgiveness_targets \
         else root_force_m
+
+    # SEQUENTIAL HALVING takes over the root entirely on full-search moves:
+    # it replaces forced visits (same job, done properly) and Dirichlet noise
+    # (replaced by the Gumbel variables, which stay OUT of child.prior so the
+    # pi' target is read from clean logits). Silently leaving either on would
+    # corrupt the target rather than fail, so they are forced off here and the
+    # override is announced.
+    sh_on = bool(sequential_halving)
+    if sh_on:
+        if full_force_m > 0 and verbose:
+            print(f"  [sequential_halving] root_force_m/forgiveness_force_m "
+                  f"({full_force_m}) ignored on full-search moves -- halving "
+                  f"replaces forced visits")
+        if add_noise and verbose:
+            print("  [sequential_halving] Dirichlet noise disabled at "
+                  "full-search roots -- Gumbel top-m sampling replaces it")
     rng = np.random.default_rng(seed)   # single source of randomness (see `seed`)
 
-    active = [_GameState() for _ in range(concurrency)]
+    active = [_GameState(rng.random() < no_adj_prob)
+              for _ in range(concurrency)]
     started = len(active)
     finished = 0
     all_examples = []
@@ -473,9 +576,21 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             planes = encode_env(env)
             v_white = _position_value_white(root, mover_sign)
             if g.is_full_move:
-                policy_target = _policy_target_sparse(visit_counts, mover)
+                if sh_on:
+                    # pi' = softmax(logit + sigma(completed-Q)) over ALL
+                    # children. Visit counts are NOT a valid target under
+                    # halving -- they encode the elimination schedule, not
+                    # action quality (see search/sequential_halving.py).
+                    policy_target = _policy_target_from_probs(
+                        improved_policy(root, sh_c_visit, sh_c_scale), mover)
+                else:
+                    policy_target = _policy_target_sparse(visit_counts, mover)
+                # Which root Qs are trustworthy: the forced floor normally, the
+                # surviving candidates' minimum visit count under halving.
+                stat_floor = (g.sh.final_floor()
+                              if (sh_on and g.sh is not None) else g.force_n)
                 if forgiveness_targets:
-                    forgiveness_t, forgiveness_m = forgiveness_target(root, g.force_n, forgiveness_tau,
+                    forgiveness_t, forgiveness_m = forgiveness_target(root, stat_floor, forgiveness_tau,
                                                   forgiveness_target_mode, forgiveness_gamma)
                 else:
                     forgiveness_t, forgiveness_m = np.float32(0.0), np.float32(0.0)
@@ -487,8 +602,27 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
 
         temp = 1.0 if g.ply < temp_moves else 0.0
         move = None
-        if forgiving_select and g.is_full_move and g.force_n > 0 \
-                and temp <= 1e-6:
+        # OPENING PLIES ALWAYS SAMPLE VISIT COUNTS.
+        # Previously the opening went through select_move_gumbel(temp=1.0).
+        # Its scores are  log prior + (c_visit + max_N) * c_scale * Q, and with
+        # a full budget of several hundred sims that sigma factor is ~350-550:
+        # a Q gap of 0.05 between two root moves becomes 20-30 logits, so
+        # softmax(scores / 1.0) is numerically an argmax. The plies that exist
+        # to give self-play its opening diversity were played deterministically
+        # and every game in a batch opened alike. Gumbel/forgiving selection are
+        # now used only where they are meaningful: at temp == 0.
+        if temp > 1e-6 and not (sh_on and g.is_full_move):
+            move = select_move(visit_counts, temp, rng)
+        if move is None and sh_on and g.is_full_move and g.sh is not None:
+            # The paper's acting rule: argmax over the surviving candidates of
+            # g(a) + logit(a) + sigma(qhat(a)). Applies in the OPENING TOO --
+            # unlike visit-count argmax this is already stochastic, because the
+            # Gumbel draws are resampled every move, so opening diversity comes
+            # from the sampling rather than from a temperature. (That is why the
+            # temp>0 branch above is skipped for SH moves.)
+            move = g.sh.select_action(root)
+        if move is None and forgiving_select and g.is_full_move \
+                and g.force_n > 0 and temp <= 1e-6:
             # delta-constrained forgiveness selection over the floored
             # candidates: play the most forgiving member of
             # { a : Q1 - Q(a) <= delta }. Falls through to visit selection
@@ -499,7 +633,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 gamma=forgiveness_gamma, stat=forgiving_stat,
                 agg=forgiving_agg, parity=forgiving_parity)
         if move is None and gumbel_select and g.is_full_move \
-                and g.force_n > 0:
+                and g.force_n > 0 and temp <= 1e-6:
             # Gumbel-AZ selection: logits + sigma(Q) over the floored
             # candidates; pruned visit counts remain the FALLBACK (and the
             # policy target, untouched above).
@@ -519,7 +653,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         if env.isTerminal() or g.ply >= max_plies:
             g.done = True
             return
-        if adj_plies > 0:
+        if adj_plies > 0 and not g.no_adj:
             diff = env.material_diff()
             if abs(diff) >= adj_margin:
                 g.adj_streak += 1
@@ -543,13 +677,20 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
         g.forced_counts = {}
         g.force_m = 0
         g.force_n = 0
-        if full and full_force_m > 0 and root_force_visits > 0:
+        g.sh = None
+        sh_here = sh_on and full
+        if sh_here:
+            # forced visits and halving are mutually exclusive; SHState is built
+            # lazily on first descent, once the root actually has children.
+            pass
+        elif full and full_force_m > 0 and root_force_visits > 0:
             g.force_m = full_force_m
             g.force_n = min(int(root_force_visits),
                             max(1, g.move_cap // (2 * full_force_m)))
         # A reused root is already expanded, so _expand never re-fires on it;
         # apply its root noise here instead (fresh roots get noise in _expand).
-        if g.root.expanded and full and add_noise:
+        # Never at an SH root: noise in .prior would land in the pi' target.
+        if g.root.expanded and full and add_noise and not sh_here:
             _add_dirichlet_noise(g.root, dirichlet_alpha, noise_frac, rng)
 
     for g in active:
@@ -570,7 +711,18 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 # floor of visits before PUCT resumes (full-search moves only).
                 # forced_set is computed lazily on first descent AFTER the root
                 # expands, so it sees post-Dirichlet priors.
-                if at_root and g.force_n > 0:
+                if at_root and sh_on and g.is_full_move:
+                    if g.sh is None:
+                        # budget = what THIS move still has to spend; a reused
+                        # subtree's carried visits are already in root.visits
+                        # and are credited by SHState (see its docstring).
+                        g.sh = SHState(node, budget=g.move_cap - node.visits,
+                                       m=sh_m, rng=rng,
+                                       c_visit=sh_c_visit, c_scale=sh_c_scale)
+                    best = g.sh.next_child()
+                    # best is None once the schedule is spent -> plain PUCT
+                    # soaks up any residual budget below.
+                elif at_root and g.force_n > 0:
                     if g.forced_set is None:
                         g.forced_set = sorted(node.children,
                                               key=lambda ch: ch.prior,
@@ -619,41 +771,68 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                 g.sims_done += 1
                 continue
 
-            legal = env.legalMoves()
-            if not legal:
-                node.terminal = True
-                r = env.result()
-                _backprop(path, r if r is not None else 0.0)
-                g.sims_done += 1
-                continue
-            if env.isRepetition() or env.isFiftyMove():
+            # ---- ORDERING: everything cheap BEFORE movegen -----------------
+            # legalMoves() is ~135 us and dominates self-play. The rule-draw
+            # checks and both caches are all pure functions of the state key,
+            # so none of them needs the move list. The old order generated
+            # moves first and then threw them away on every cache hit.
+            mover = env.board.sideToMove
+            bkey = env.board.stateKey()
+            rep = env.counts.get(bkey, 1)
+
+            if rep >= 3 or env.halfmove_clock >= 100:     # threefold / fifty-move
                 node.terminal = True
                 _backprop(path, 0.0)
                 g.sims_done += 1
                 continue
 
-            mover = env.board.sideToMove
-            # The net input now includes the halfmove clock and repetition
-            # count, so the eval cache MUST key on them too -- two visits to
-            # the same board with different counters are different net inputs.
-            # (This costs cache hit-rate on repetition revisits; that loss is
-            # correctness, not waste: the net SHOULD re-evaluate rep=2 lower.)
-            bkey = env.board.stateKey()
-            rep = env.counts.get(bkey, 1)
+            # eval cache: the stored priors dict is keyed BY the legal moves,
+            # so a hit needs no move generation at all.
             if cache is not None:
-                key = (bkey, env.halfmove_clock, rep)
-                hit = cache.get(key)
+                hit = cache.get((bkey, env.halfmove_clock, rep))
                 if hit is not None:
                     priors, value, v_sh = hit
-                    _expand(node, priors, mover, add_noise and g.is_full_move,
-                            node is g.root, dirichlet_alpha, noise_frac, rng)
+                    _expand(node, priors, mover,
+                            add_noise and g.is_full_move
+                            and not (sh_on and g.is_full_move),
+                            node is g.root, dirichlet_alpha, noise_frac, rng,
+                            net_value=value)
                     sgn = 1.0 if mover == "white" else -1.0
                     _backprop(path, sgn * value, sgn * v_sh)
                     g.sims_done += 1
                     continue
 
+            # legal-move cache: legality is a pure function of the state key
+            # (which already carries side-to-move, castling rights and the ep
+            # square), and is INDEPENDENT of the halfmove clock / repetition
+            # count -- so this hits far more often than the eval cache.
+            entry = lm_cache.get(bkey) if lm_cache is not None else None
+            if entry is None:
+                legal = env.legalMoves()
+                # the POV action index of a move depends only on the move and
+                # the side to move, both fixed by bkey -- so cache them with
+                # the move list instead of recomputing per evaluation.
+                idxs = [encodeMovePOV(m, mover) for m in legal] if legal else []
+                entry = (legal, idxs)
+                if lm_cache is not None and len(lm_cache) < cache_cap:
+                    lm_cache[bkey] = entry
+            legal, idxs = entry
+
+            if not legal:
+                node.terminal = True
+                # no legal moves => mate or stalemate. The old code called
+                # env.result(), which re-ran checkMate() AND staleMate(), i.e.
+                # two more full legal-move generations. One inCheck() decides it.
+                if env.board.inCheck(mover):
+                    leaf = -1.0 if mover == "white" else 1.0
+                else:
+                    leaf = 0.0
+                _backprop(path, leaf)
+                g.sims_done += 1
+                continue
+
             batch_planes.append(encode(env.board, env.halfmove_clock, rep))
-            batch_meta.append((g, node, env, legal, path, mover, bkey, rep))
+            batch_meta.append((g, node, env, legal, path, mover, bkey, rep, idxs))
 
         # ---- single batched network forward ----
         if batch_planes:
@@ -672,9 +851,8 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             else:
                 logits_b, values_b = out[0], out[1]
                 shaped_b = values_b
-            for (g, node, env, legal, path, mover, bkey, rep), logits, value, \
-                    v_sh in zip(batch_meta, logits_b, values_b, shaped_b):
-                idxs = [encodeMovePOV(m, mover) for m in legal]
+            for (g, node, env, legal, path, mover, bkey, rep, idxs), logits, \
+                    value, v_sh in zip(batch_meta, logits_b, values_b, shaped_b):
                 probs = _softmax(np.asarray(logits)[idxs])
                 priors = {m: float(p) for m, p in zip(legal, probs)}
                 value = float(value)
@@ -684,8 +862,11 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     # the whole call, so hits agree)
                     cache[(bkey, env.halfmove_clock, rep)] = \
                         (priors, value, v_sh)
-                _expand(node, priors, mover, add_noise and g.is_full_move,
-                        node is g.root, dirichlet_alpha, noise_frac, rng)
+                _expand(node, priors, mover,
+                        add_noise and g.is_full_move
+                        and not (sh_on and g.is_full_move),
+                        node is g.root, dirichlet_alpha, noise_frac, rng,
+                        net_value=value)
                 sgn = 1.0 if mover == "white" else -1.0
                 _backprop(path, sgn * value, sgn * v_sh)
                 g.sims_done += 1
@@ -700,7 +881,7 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
             if g.done:
                 all_examples.extend(finalize(g))
                 if started < num_games:
-                    ng = _GameState()
+                    ng = _GameState(rng.random() < no_adj_prob)
                     _begin_move(ng)
                     still.append(ng)
                     started += 1
@@ -758,7 +939,7 @@ def _make_torch_eval_fn(net, return_forgiveness=False):
 
 def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            temp_moves=30, c=1.5, concurrency=64,
-                           adj_margin=5.0, adj_plies=20,
+                           adj_margin=5.0, adj_plies=20, no_adj_prob=0.1,
                            use_cache=True, cache_cap=200_000,
                            reuse_tree=True, full_search_prob=1.0,
                            fast_iterations=None,
@@ -770,6 +951,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
                            record_fast_rows=True,
                            gumbel_select=False, gumbel_c_visit=50.0,
                            gumbel_c_scale=1.0,
+                           sequential_halving=False, sh_m=16,
+                           sh_c_visit=50.0, sh_c_scale=0.02,
                            forgiving_select=False, forgiving_delta=0.05,
                            forgiving_stat="gap", forgiving_agg="tree",
                            forgiving_parity=1,
@@ -802,7 +985,7 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         eval_fn, num_games,
         iterations=iterations, concurrency=concurrency,
         max_plies=max_plies, temp_moves=temp_moves, c=c,
-        adj_margin=adj_margin, adj_plies=adj_plies,
+        adj_margin=adj_margin, adj_plies=adj_plies, no_adj_prob=no_adj_prob,
         use_cache=use_cache, cache_cap=cache_cap,
         reuse_tree=reuse_tree, full_search_prob=full_search_prob,
         fast_iterations=fast_iterations,
@@ -814,6 +997,8 @@ def generate_games_batched(net, num_games, iterations=400, max_plies=200,
         record_fast_rows=record_fast_rows,
         gumbel_select=gumbel_select, gumbel_c_visit=gumbel_c_visit,
         gumbel_c_scale=gumbel_c_scale,
+        sequential_halving=sequential_halving, sh_m=sh_m,
+        sh_c_visit=sh_c_visit, sh_c_scale=sh_c_scale,
         forgiving_select=forgiving_select, forgiving_delta=forgiving_delta,
         forgiving_stat=forgiving_stat, forgiving_agg=forgiving_agg,
         forgiving_parity=forgiving_parity,

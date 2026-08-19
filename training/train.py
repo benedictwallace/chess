@@ -1,5 +1,4 @@
 import random
-from collections import deque
 
 import numpy as np
 import torch
@@ -9,19 +8,102 @@ from torch.amp import autocast, GradScaler
 from model.move_encoding import NUM_ACTIONS
 
 
-class ReplayBuffer:
-    def __init__(self, capacity=50_000):
-        self.buffer = deque(maxlen=capacity)
+class _Ring:
+    """Fixed-capacity ring buffer backed by a LIST, not a deque.
 
-    def add_examples(self, examples):
-        self.buffer.extend(examples)
+    random.sample() indexes its population, and deque.__getitem__ is O(n) --
+    so sampling k rows from a d-element deque costs O(k*d). Measured on a
+    300k-row buffer: 64 batches of 256 took 59.7 ms from a deque vs 12.2 ms
+    from a list. Same eviction semantics (oldest row overwritten first).
+    """
+    __slots__ = ("data", "capacity", "pos")
+
+    def __init__(self, capacity):
+        self.capacity = max(1, int(capacity))
+        self.data = []
+        self.pos = 0
+
+    def append(self, x):
+        if len(self.data) < self.capacity:
+            self.data.append(x)
+        else:
+            self.data[self.pos] = x
+            self.pos += 1
+            if self.pos == self.capacity:
+                self.pos = 0
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.data)
+
+    def sample(self, k):
+        return random.sample(self.data, min(k, len(self.data)))
+
+
+def _has_policy(example):
+    """True if this row carries a policy target (vs a value-only fast row)."""
+    p = example[1]
+    if isinstance(p, tuple):          # sparse (indices, probs)
+        return len(p[0]) > 0
+    return bool(p.sum() > 0)          # legacy dense row
+
+
+class ReplayBuffer:
+    """Replay buffer that keeps POLICY rows and VALUE-ONLY rows in separate
+    pools and composes every batch from both.
+
+    WHY THE SPLIT. With record_fast_rows=True most rows are value-only
+    (playout-capped plies with an empty policy target). Sampling uniformly
+    from one pool means a batch of 256 contains only ~256*full_search_prob
+    policy rows -- at full_search_prob=0.25 that is 64. train_epoch already
+    normalises the policy loss by the mask sum, so the policy gradient is not
+    SCALED down, but it is still estimated from a quarter of the batch, i.e.
+    it is ~2x noisier than the batch size suggests. Drawing a fixed fraction
+    of each batch from the policy pool fixes that at no extra cost: same 256
+    rows forward, twice the policy rows in them.
+
+    policy_frac is the share of each batch drawn from the policy pool (0.5 =
+    half). If either pool is short the other backfills, so early iterations
+    and full_search_prob=1.0 both behave sensibly.
+
+    CAPACITY SPLIT AND STALENESS. Each pool holds its own most-recent rows, so
+    a pool of size M spans M / (arrival rate) of history. Policy rows arrive at
+    rate full_search_prob and value-only rows at (1 - full_search_prob), so
+    equal-sized pools give both the same time-horizon only when
+    full_search_prob = 0.5. Set policy_capacity_frac = full_search_prob to keep
+    the two windows aligned at other settings; otherwise the smaller stream is
+    held longer and its rows are staler.
+    """
+
+    def __init__(self, capacity=50_000, policy_frac=0.5,
+                 policy_capacity_frac=0.5):
+        pc = max(1, int(capacity * policy_capacity_frac))
+        vc = max(1, capacity - pc)
+        self.policy_rows = _Ring(pc)
+        self.value_rows = _Ring(vc)
+        self.policy_frac = float(policy_frac)
+
+    def add_examples(self, examples):
+        pr, vr = self.policy_rows, self.value_rows
+        for e in examples:
+            (pr if _has_policy(e) else vr).append(e)
+
+    def __len__(self):
+        return len(self.policy_rows) + len(self.value_rows)
+
+    def counts(self):
+        """(policy_rows, value_only_rows) -- for logging the real mix."""
+        return len(self.policy_rows), len(self.value_rows)
 
     def sample(self, batch_size):
-        n = min(batch_size, len(self.buffer))
-        return random.sample(self.buffer, n)
+        want_p = int(round(batch_size * self.policy_frac))
+        n_p = min(want_p, len(self.policy_rows))
+        n_v = min(batch_size - n_p, len(self.value_rows))
+        # backfill from whichever pool still has rows
+        if n_p + n_v < batch_size:
+            n_p = min(len(self.policy_rows), batch_size - n_v)
+        out = self.policy_rows.sample(n_p) + self.value_rows.sample(n_v)
+        random.shuffle(out)
+        return out
 
 
 def _collate(batch, device, aux_forgiveness=False):
@@ -118,7 +200,8 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
     decoupled = aux_forgiveness and getattr(inner, "forgiveness_detach", True)
 
     net.train()
-    acc = dict(total=0.0, policy=0.0, value=0.0, forgiveness=0.0)
+    acc = dict(total=0.0, policy=0.0, value=0.0, forgiveness=0.0,
+               policy_kl=0.0, target_entropy=0.0)
     actual = 0
     # masked forgiveness-target statistics, accumulated over the whole epoch. The raw
     # forgiveness MSE is uninterpretable on its own (its floor is the label noise);
@@ -160,6 +243,32 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
             # then identical to a run without value-only rows.
             ce = -(policy_t * log_probs).sum(dim=1, keepdim=True)     # (B,1)
             policy_loss = (ce * pmask).sum() / pmask.sum().clamp(min=1.0)
+
+            # ---- TARGET ENTROPY AND KL --------------------------------------
+            # Cross-entropy decomposes exactly as
+            #     CE = H(target) + KL(target || prediction)
+            # and ONLY the KL term is learnable. H(target) is a property of the
+            # SEARCH, not the net: it is set by the simulation count, the root
+            # Dirichlet noise, and how genuinely ambiguous the position is. It
+            # does not shrink as the net improves -- measured on this codebase
+            # it sits around 1.7 nats (perplexity ~5.4) at 400 sims, and rises
+            # slightly at 800 because deeper search explores more.
+            #
+            # So a policy CE of ~2.05 is ~1.7 floor plus ~0.35 of real error,
+            # and a run that moves CE by 0.05 has actually cut its error by
+            # ~14%. Logging CE alone makes genuine progress look like a plateau
+            # -- which is exactly what it did here, while the same checkpoints
+            # gained 236 Elo head-to-head.
+            #
+            # These are diagnostics only: no gradient flows from them, and the
+            # optimisation target is unchanged.
+            with torch.no_grad():
+                tent = -(policy_t * torch.log(policy_t.clamp(min=1e-12))
+                         ).sum(dim=1, keepdim=True)                   # (B,1)
+                denom = pmask.sum().clamp(min=1.0)
+                target_entropy = (tent * pmask).sum() / denom
+                policy_kl = policy_loss - target_entropy
+
             value_loss = F.mse_loss(value_p, value_t)
             loss_pv = policy_loss + value_loss
 
@@ -201,6 +310,8 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
 
         acc["total"] += loss.item()
         acc["policy"] += policy_loss.item()
+        acc["policy_kl"] += policy_kl.item()
+        acc["target_entropy"] += target_entropy.item()
         acc["value"] += value_loss.item()
         if aux_forgiveness:
             acc["forgiveness"] += forgiveness_loss.item()
