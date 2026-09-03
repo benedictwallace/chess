@@ -22,6 +22,71 @@ class ResidualBlock(nn.Module):
         return F.relu(x + residual)
 
 
+def load_forgiveness_head(net, path, mode, which="best", verbose=True):
+    """Install one offline-trained forgiveness head into `net`, in place.
+
+    train_forgiveness_heads.py trains a head per definition ("gap", "entropy",
+    "tree_gap", "tree_entropy", "flat_gap", "flat_entropy", and the parity
+    variants "tree_gap_me", "tree_gap_opp", "flat_entropy_me",
+    "flat_entropy_opp") off one frozen trunk, and writes them to
+    forgiveness_heads_all.pt as {mode: {state, final_state, val_R2, ...}}.
+    This picks one and copies it over the four forgiveness_* layers, leaving
+    trunk / policy / value untouched -- which is sound because the head reads
+    DETACHED trunk features, so swapping it cannot change how the net plays,
+    only what F_hat it reports.
+
+    Which mode you want depends on how the head is used. For SHAPING it must be
+    parity-BLENDED (e.g. "flat_entropy"): the bonus is applied symmetrically at
+    every leaf, so a "*_me"-style head trained on one side's slack would be
+    read as the mover's slack by both players and reward the opponent for the
+    same positions it rewards you for.
+
+    path may also be a per-mode FULL checkpoint written by the same script
+    ({stem}_forgiveness_{mode}.pt, keyed "model_state"), in which case its
+    forgiveness_* keys are used and `mode` only checked against its config.
+
+    which: "best" (best val R2 snapshot, the default) or "final" (last epoch).
+    Returns the val R2 recorded for that head, or None if unknown.
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    target = getattr(net, "_orig_mod", net)
+
+    if "model_state" in blob:                      # full per-mode checkpoint
+        state = {k: v for k, v in blob["model_state"].items()
+                 if k.startswith("forgiveness_")}
+        saved_mode = blob.get("config", {}).get("forgiveness_target_mode")
+        if mode and saved_mode and saved_mode != mode:
+            raise ValueError(f"{path} holds the '{saved_mode}' head, not "
+                             f"'{mode}'")
+        r2 = (blob.get("config", {}).get("forgiveness_head_offline", {})
+              .get("val_R2"))
+    else:                                          # forgiveness_heads_all.pt
+        modes = [k for k in blob if k != "_meta"]
+        if mode not in blob:
+            raise KeyError(f"no '{mode}' head in {path}; available: "
+                           f"{sorted(modes)}")
+        rec = blob[mode]
+        key = "state" if which == "best" else "final_state"
+        if rec.get(key) is None:
+            raise ValueError(f"'{mode}' has no {which} state in {path}")
+        state = rec[key]
+        r2 = rec.get("val_R2")
+
+    if not state:
+        raise ValueError(f"no forgiveness_* parameters found in {path}")
+
+    missing, unexpected = target.load_state_dict(state, strict=False)
+    unexpected = [k for k in unexpected if k.startswith("forgiveness_")]
+    if unexpected:
+        raise ValueError(f"unexpected forgiveness keys in {path}: {unexpected}")
+    loaded = sorted(state.keys())
+    if verbose:
+        r2s = f"{r2:+.3f}" if isinstance(r2, (int, float)) else "unknown"
+        print(f"forgiveness head '{mode}' ({which}) loaded from {path} "
+              f"-- val R2 {r2s}, {len(loaded)} tensors")
+    return r2
+
+
 class ChessNet(nn.Module):
     """
     WHAT CHANGED vs the previous version, and why.
@@ -123,5 +188,6 @@ class ChessNet(nn.Module):
         forgiveness = torch.sigmoid(self.forgiveness_fc2(e))
 
         return policy_logits, value, forgiveness
+
 
     

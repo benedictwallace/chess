@@ -63,10 +63,35 @@ BUDGET
 sequential halving spends n simulations over ceil(log2(m)) phases, each phase
 giving every surviving candidate an equal number of visits and then discarding
 the worse half by  g(a) + logit(a) + sigma(qhat(a)).  With n=1000 and m=16 that
-is 4 phases of roughly 250 visits spread over 16, 8, 4, 2 candidates: the two
-finalists end up with ~180 visits each and matched standard errors -- which is
-exactly the property the forgiveness statistics need, obtained for free rather
-than by pinning half the budget to a forced floor.
+is 4 phases of roughly 250 visits spread over 16, 8, 4, 2 candidates, giving
+cumulative per-candidate targets of 15, 46, 108, 240: the two finalists end up
+with ~240 visits each and matched standard errors -- which is exactly the
+property the forgiveness statistics need, obtained for free rather than by
+pinning half the budget to a forced floor.
+
+THE STATISTICS SET  (stat_width / stat_floor)
+---------------------------------------------
+Halving terminates at TWO candidates, so `final_floor()` admits exactly two
+actions. That is the right floor for deciding a move and the wrong one for
+measuring forgiveness: the normalised entropy would run over n=2 at every root
+and collapse into a reparameterisation of the action gap, which is the statistic
+it was introduced to improve on (see the 0.8/0.79/0.1/0.1 vs 0.8/0.75/0.75/0.7
+example in the write-up).
+
+So the search still halves to two -- the finalists get the deep budget and
+decide the move -- but the top `stat_width` (default 4) candidates are
+snapshotted at the last phase advance and exposed via `stat_children()` /
+`stat_floor()`. Those four hold 108+ visits each, enough for a usable Q, and
+they were matched EXACTLY at the moment they were compared. The two that lost
+the 4 -> 2 halving stay at 108 while the finalists run on to 240, so the final
+set is matched to a factor of ~2.2 in visits rather than exactly; that is the
+deliberate trade for a four-way comparison instead of a two-way one.
+
+Note the residual selection effect: the two that were cut ARE cut because they
+scored low, so their Qs are frozen slightly pessimistic. At 108 visits the
+distortion is far smaller than it would be for the phase-0 casualties at 15
+visits, which is why the snapshot is taken at the LAST advance and not earlier,
+and why eliminated actions below stat_width are not admitted at all.
 
 Interior nodes keep plain PUCT. The paper uses a deterministic non-PUCT rule
 there too; that is a larger change with its own hyperparameters, and the root is
@@ -146,7 +171,29 @@ def sigma_scale(root, c_visit=50.0, c_scale=1.0):
 # --------------------------------------------------------------------------- #
 # completed Q  (v_mix)
 # --------------------------------------------------------------------------- #
-def root_v_mix(root):
+def _node_value(node, shaped=False):
+    """The backed-up value of `node`, from whichever track the caller steers
+    on: .value_sh under forgiveness value shaping, .value otherwise.
+
+    Every Q read in this module goes through here. That is the point: the
+    shaped track must reach the eliminations, the completed Qs behind pi', and
+    the action played, or shaping cannot influence a halving search at all.
+    Unlike plain AlphaZero -- where the preference arrived through visit
+    allocation because the visit counts WERE the target -- halving fixes the
+    allocation by schedule, so this is the only remaining channel.
+
+    Falls back to .value when a node has no .value_sh (a Node from an older
+    tree, or a caller that never shaped anything), so mixed trees degrade
+    rather than raise.
+    """
+    if shaped:
+        v = getattr(node, "value_sh", None)
+        if v is not None:
+            return v
+    return node.value
+
+
+def root_v_mix(root, shaped=False):
     """
     The paper's v_mix: the value assigned to a root action that search never
     visited, interpolating the root's own network value with the prior-weighted
@@ -181,13 +228,14 @@ def root_v_mix(root):
         if n > 0:
             sum_n += n
             w_pi += ch.prior
-            w_piq += ch.prior * (ch.value / n)
+            w_piq += ch.prior * (_node_value(ch, shaped) / n)
 
     v_root = getattr(root, "net_value", None)
     if v_root is None:
         if sum_n == 0:
             return 0.0
-        return sum(ch.value for ch in kids if ch.visits > 0) / sum_n
+        return sum(_node_value(ch, shaped)
+                   for ch in kids if ch.visits > 0) / sum_n
 
     if sum_n == 0 or w_pi <= 0.0:
         return float(v_root)
@@ -220,22 +268,28 @@ def _rescale(vals):
     return [(v - lo) / span for v in vals]
 
 
-def completed_q_map(root):
+def completed_q_map(root, shaped=False):
     """
     {child -> qhat} in the root mover's POV: the search Q where visited, v_mix
     where not. Returns (dict, v_mix).
+
+    shaped=True reads the shaped value track (see _node_value). v_mix is then
+    also computed from shaped values, so the completion is on the same scale
+    as the visited Qs it interpolates -- mixing tracks here would make an
+    unvisited action's imputed value incomparable with a visited one's.
     """
-    vm = root_v_mix(root)
+    vm = root_v_mix(root, shaped)
     out = {}
     for ch in root.children:
-        out[ch] = (ch.value / ch.visits) if ch.visits > 0 else vm
+        out[ch] = (_node_value(ch, shaped) / ch.visits) if ch.visits > 0 else vm
     return out, vm
 
 
 # --------------------------------------------------------------------------- #
 # the improved policy pi'  -- THE TRAINING TARGET
 # --------------------------------------------------------------------------- #
-def improved_policy(root, c_visit=50.0, c_scale=0.02, rescale=True):
+def improved_policy(root, c_visit=50.0, c_scale=0.02, rescale=True,
+                    shaped=False):
     """
     pi'(a) = softmax_a ( log prior(a) + sigma(qhat(a)) )   over ALL children.
 
@@ -255,7 +309,7 @@ def improved_policy(root, c_visit=50.0, c_scale=0.02, rescale=True):
     if not kids:
         return {}
 
-    qhat, _ = completed_q_map(root)
+    qhat, _ = completed_q_map(root, shaped)
     scale = sigma_scale(root, c_visit, c_scale)
 
     qs = [qhat[ch] for ch in kids]
@@ -294,18 +348,26 @@ class SHState:
     simulations) compatible with halving.
     """
 
-    __slots__ = ("candidates", "gumbel", "plan", "phase", "target",
-                 "c_visit", "c_scale", "exhausted", "_m0")
+    __slots__ = ("candidates", "stat_candidates", "stat_width", "gumbel",
+                 "plan", "phase", "target", "c_visit", "c_scale", "exhausted",
+                 "_m0", "shaped")
 
     def __init__(self, root, budget, m=16, rng=None,
-                 c_visit=50.0, c_scale=1.0):
+                 c_visit=50.0, c_scale=1.0, stat_width=4, shaped=False):
         kids = root.children
         self.c_visit = c_visit
         self.c_scale = c_scale
+        # Steer the eliminations and the played action on the shaped value
+        # track. The visit SCHEDULE is unaffected -- shaping changes which
+        # candidates survive a phase, never how many visits a phase spends --
+        # so the statistics set stays matched in visits either way.
+        self.shaped = bool(shaped)
+        self.stat_width = max(2, int(stat_width))
         self.exhausted = False
         self.phase = 0
         self.gumbel = {}
         self.candidates = []
+        self.stat_candidates = []
         self.plan = []
         self._m0 = 0
 
@@ -340,6 +402,12 @@ class SHState:
         for i in order:
             self.gumbel[kids[i]] = float(g[i])
 
+        # Seeded here so that a root with m <= stat_width (few legal moves), or
+        # a search that dies before the first halving, still exposes a usable
+        # statistics set. Overwritten at every phase advance with a
+        # better-visited snapshot -- see _advance_phase.
+        self.stat_candidates = list(self.candidates[:self.stat_width])
+
         self.plan = plan_phases(budget, m)
         if not self.plan:
             self.exhausted = True
@@ -371,7 +439,8 @@ class SHState:
             return {}
         scale = (self.c_visit
                  + max(c.visits for c in cands)) * self.c_scale
-        raw = [(c.value / c.visits) if c.visits > 0 else 0.0 for c in cands]
+        raw = [(_node_value(c, self.shaped) / c.visits) if c.visits > 0
+               else 0.0 for c in cands]
         lo, hi = min(raw), max(raw)
         span = hi - lo
         out = {}
@@ -383,15 +452,27 @@ class SHState:
         return out
 
     def _advance_phase(self):
-        """Halve the candidate set by score and move to the next phase."""
+        """Halve the candidate set by score and move to the next phase.
+
+        Also refreshes `stat_candidates`. At the moment this runs, every
+        surviving candidate has just reached the same cumulative visit target,
+        so the top `stat_width` of them are matched-variance by construction --
+        this is the only point in the schedule where a wider set can be
+        snapshotted cleanly. Each advance overwrites the previous snapshot, so
+        what survives to the end of the search is the widest set taken at the
+        deepest (best-visited) phase: with n=1000, m=16, stat_width=4 that is
+        the four candidates alive at the 4 -> 2 halving, each holding 108
+        visits, two of which then go on to 240.
+        """
         if self.phase + 1 >= len(self.plan) or len(self.candidates) <= 2:
             self.exhausted = True
             return
         self.phase += 1
         keep = self.plan[self.phase][0]
         sc = self._scores()
-        self.candidates = sorted(self.candidates, key=lambda c: sc[c],
-                                 reverse=True)[:keep]
+        ranked = sorted(self.candidates, key=lambda c: sc[c], reverse=True)
+        self.stat_candidates = ranked[:self.stat_width]
+        self.candidates = ranked[:keep]
         self.target = self._phase_target(self.phase)
 
     # -- public ------------------------------------------------------------- #
@@ -416,14 +497,46 @@ class SHState:
 
     def final_floor(self):
         """
-        Minimum visit count among the surviving candidates -- the analogue of
-        the old forced-visit floor `force_n`, for statistics that need to know
-        which root Qs are trustworthy (search/forgiveness.py takes this as its
-        `floor` argument).
+        Minimum visit count among the SURVIVING candidates -- i.e. the two
+        finalists once a full schedule has run (~240 visits at n=1000, m=16).
+
+        This is the strictest available floor and the analogue of the old
+        forced-visit floor `force_n`. Note that it admits only two actions,
+        which makes any statistic computed over it a function of the top pair
+        alone; `stat_floor()` is what the forgiveness statistics should use.
+        Kept for callers that want the tightest possible variance match.
         """
         if not self.candidates:
             return 0
         return min(c.visits for c in self.candidates)
+
+    def stat_children(self):
+        """
+        The children whose Qs the forgiveness statistics may compare: the top
+        `stat_width` actions as of the last phase advance.
+
+        Prefer this over `stat_floor()` where the caller can take an explicit
+        set. A floor is a visit threshold, and under subtree reuse a child that
+        was never a candidate this move can arrive carrying enough inherited
+        visits to clear it; the explicit set cannot be contaminated that way.
+        """
+        return list(self.stat_candidates)
+
+    def stat_floor(self):
+        """
+        Minimum visit count over `stat_children()` -- the floor to hand to
+        search/forgiveness.py so that the statistics see a wider set than the
+        final pair.
+
+        With n=1000, m=16, stat_width=4 this returns 108: the two semi-final
+        losers stopped there while the two finalists went on to 240. The set is
+        therefore matched to within a factor of ~2.2 in visits (~1.5 in
+        standard error) rather than exactly, which is the deliberate trade for
+        having four actions in the comparison instead of two.
+        """
+        if not self.stat_candidates:
+            return 0
+        return min(c.visits for c in self.stat_candidates)
 
     def select_action(self, root):
         """

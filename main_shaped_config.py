@@ -1,48 +1,3 @@
-"""
-CONTROL ARM of the forgiveness-shaping experiment.
-
-Identical to the shaped arm's main.py in EVERY respect except two keys:
-
-    forgiveness_shaping_beta   0.03  ->  0.0     (the variable under test)
-    forgiveness_targets        True  ->  False   (no labels, head not trained)
-    checkpoint_dir             checkpoints_shaped -> checkpoints_baseline_ext
-
-Everything else -- search_iterations=800, full_search_prob=0.5,
-fast_search_iterations=100, root_force_m=0, gumbel_select=False,
-lr_schedule="constant", lr=4e-4, batch_size, buffer, target ratio -- is
-byte-identical, so any measured difference is attributable to the shaping and
-not to the search budget, the schedule, or the data pipeline.
-
-WHY forgiveness_targets=False DOES NOT CHANGE THE SEARCH HERE
-------------------------------------------------------------
-Normally that flag would, via
-    full_cap     = search_iterations + forgiveness_extra_sims
-    full_force_m = max(root_force_m, forgiveness_force_m)
-But the shaped arm was deliberately configured with
-    forgiveness_extra_sims = 0
-    forgiveness_force_m    = 0
-    root_force_m           = 0
-so both expressions collapse to the baseline values whichever way the flag is
-set. Both arms therefore run exactly search_iterations simulations per full
-move with no forced-visit floor. Do not change those three keys in either arm
-without re-running both.
-
-PROTOCOL
---------
-  fork point : net_iter11275.pt (the offline-head merge; its backbone is
-               net_iter11275's, with only forgiveness_* keys replaced)
-  stop point : iteration 13100, matching the shaped arm exactly
-  Both numbers were fixed BEFORE any comparison was run.
-
-    mkdir -p checkpoints_baseline_ext
-    cp checkpoints/net_iter11275.pt checkpoints_baseline_ext/latest.pt
-    python main_multigpu.py --gpus 4,5,6 --actors-per-gpu 6 --target-ratio 5 \
-        --total-train-steps 5000000 2>&1 | tee -a checkpoints_baseline_ext/run.log
-
-Stop at iteration 13100. loss_forgiveness and forgiveness_R2 must log 0.0000
-throughout -- that is the check that this arm really is unshaped.
-"""
-
 # Cython legal-move generation: patches Board.legalMoves in place. MUST be
 # imported before anything that touches engine.board -- model.network and
 # training.* both pull it in transitively, so this has to be the FIRST project
@@ -158,13 +113,7 @@ CONFIG = dict(
     # 0.003 was in any case an order of magnitude below the typical Q gap it
     # was meant to break, so it cost a 3-output forward for no effect. When you
     # run the treatment arm, use 0.02-0.05 per the docstring.
-    forgiveness_shaping_beta=0.0,      # CONTROL ARM: this is THE variable under
-                                       # test. The shaped arm ran 0.03, which
-                                       # makes PUCT descend on Node.value_sh
-                                       # (raw Q + beta*(2F-1)) instead of raw Q.
-                                       # At 0.0 the eval path returns the plain
-                                       # 2-tuple, value_sh == value everywhere,
-                                       # and the descent is textbook PUCT.
+    forgiveness_shaping_beta=0.03,
     # STAGING: shaping only activates once the run reaches this iteration --
     # head TRAINING can start from iteration 0 (fitting labels is harmless),
     # but the search should not CONSUME the head until value/policy/labels
@@ -297,19 +246,7 @@ CONFIG = dict(
     # from any checkpoint by train_forgiveness_heads.py, which is also the
     # cleaner experimental design: the control's search was never touched.
     # With this False, train_epoch's aux_forgiveness path is off too.
-    forgiveness_targets=False,         # CONTROL ARM: no forgiveness labels are
-                                       # generated and train_epoch's
-                                       # aux_forgiveness path is off, so the
-                                       # forgiveness head is never trained here.
-                                       # SEARCH IS UNAFFECTED EITHER WAY: the
-                                       # shaped arm already ran with
-                                       # forgiveness_extra_sims=0 and
-                                       # forgiveness_force_m=0, so full_cap and
-                                       # full_force_m are identical in both arms
-                                       # (see self_play_batched lines ~470-480).
-                                       # That was the point of zeroing them --
-                                       # it keeps this flag from silently
-                                       # changing the sim budget between arms.
+    forgiveness_targets=True,
     forgiveness_tau=0.0178,             # probe_forgiveness calibration: median(gap)/ln 2.
                                 # Recalibrated 2026-07 from a 300-position
                                 # probe of the iter800 (128x8, FPU) net:
@@ -402,7 +339,7 @@ CONFIG = dict(
                                 # rises -- see the table in the module docstring.
 
     # io
-    checkpoint_dir="checkpoints_baseline_ext",
+    checkpoint_dir="checkpoints_shaped",
     checkpoint_every=25,
     metrics_file="metrics_sh.csv",
     resume=True,                # auto-load latest.pt at startup if present
@@ -715,4 +652,3 @@ def main(cfg=CONFIG):
 if __name__ == "__main__":
     main()
 
-    

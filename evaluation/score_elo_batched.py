@@ -33,10 +33,32 @@ Eval cache: checkpoints are FIXED for the whole run, so the cache is keyed by
 recur constantly. It stores legal-move priors + value (a few KB/entry), bounded
 by cache_cap.
 
+ROOT VISIT ALLOCATION: by default the root is plain PUCT, which is fine when
+all you want is a win rate -- selection is by visit count and the ranking
+survives unequal Q precision. It is NOT fine for anything that compares root Q
+values ACROSS actions, because PUCT concentrates the budget and leaves
+second-tier children holding a handful of visits and a Q that is essentially
+one leaf evaluation. Pass sequential_halving=True to allocate the root budget
+by Gumbel top-m + sequential halving instead, exactly as full-search self-play
+moves do: every survivor of a phase carries the same visit count by
+construction, the top sh_stat_width actions are snapshotted at each phase
+advance as a matched-variance statistics set (g.sh.stat_children()), and the
+move played comes from pi' rather than from visit counts. Interior nodes stay
+on PUCT in both modes.
+
 The core run_elo_matches_batched() takes injected eval_fns and anchor agents and
 imports no torch, so it is unit-testable on CPU with fakes; main() lazy-imports
 the torch / arena / score_elo pieces.
 """
+
+# MUST be first: patches Board.legalMoves() with the Cython generator
+# before anything imports engine.board. The search is move-generation
+# bound, so this is worth roughly 3x end to end.
+try:
+    from evaluation.fast_movegen_boot import ensure_fast_movegen
+except ImportError:
+    from fast_movegen_boot import ensure_fast_movegen
+ensure_fast_movegen()
 
 import math
 import numpy as np
@@ -50,13 +72,35 @@ from model.encoding import encode_env
 from search.puct import node_fpu_q, select_move_gumbel
 from model.move_encoding import encodeMovePOV
 
+# Sequential halving is OPTIONAL here: the module still imports (and the plain
+# PUCT path still runs) if search/sequential_halving.py is unavailable. Asking
+# for sequential_halving=True without it is an error, not a silent fallback.
+try:                                        # repo-layout tolerant
+    from search.sequential_halving import SHState, improved_policy
+except ImportError:                         # pragma: no cover
+    try:
+        from sequential_halving import SHState, improved_policy
+    except ImportError:
+        SHState = None
+        improved_policy = None
+
 
 # --------------------------------------------------------------------------- #
 # MCTS primitives (torch-free; mirror search.puct with add_noise always off)
 # --------------------------------------------------------------------------- #
 class Node:
+    # net_value: the RAW network evaluation of THIS position in the POV of the
+    # player to move here, stored at expansion. Roots carry moverSign == 0 so
+    # their .value accumulator stays 0 and cannot stand in for it; the Gumbel
+    # v_mix completion (sequential_halving.root_v_mix) needs it, and without
+    # the slot it degraded silently to the visit-weighted child average.
+    # value / value_sh: DUAL-TRACK values, mirroring
+    # training/self_play_batched.py. .value is the RAW backed-up network
+    # value; .value_sh carries the forgiveness-shaped one. With shaping off
+    # they hold identical numbers and every code path below is unchanged.
     __slots__ = ("parent", "move", "prior", "children",
-                 "visits", "value", "moverSign", "terminal", "expanded")
+                 "visits", "value", "value_sh", "moverSign", "terminal",
+                 "expanded", "net_value")
 
     def __init__(self, parent=None, move=None, prior=0.0):
         self.parent = parent
@@ -65,9 +109,11 @@ class Node:
         self.children = []
         self.visits = 0
         self.value = 0.0
+        self.value_sh = 0.0
         self.moverSign = 0
         self.terminal = False
         self.expanded = False
+        self.net_value = None
 
 
 def _softmax(x):
@@ -76,19 +122,68 @@ def _softmax(x):
     return e / e.sum()
 
 
-def _expand(node, priors, mover):
+def _expand(node, priors, mover, net_value=None):
     sign = 1 if mover == "white" else -1
     for m, p in priors.items():
         child = Node(parent=node, move=m, prior=p)
         child.moverSign = sign
         node.children.append(child)
     node.expanded = True
+    if net_value is not None:
+        node.net_value = float(net_value)
 
 
-def _backprop(path, leaf_value_white):
+class _ZeroGumbel:
+    """np.random.Generator stand-in exposing only what SHState uses, with the
+    Gumbel variables pinned to ZERO.
+
+    Gumbel top-m sampling is EXPLORATION: it is what replaces Dirichlet noise
+    in self-play. In a rated arena game exploration is a handicap and a source
+    of variance -- two arms differing only in their selection rule would also
+    differ in which actions each even considered. With zeros, top-m is exactly
+    the top m priors and select_action is the deterministic
+    argmax(logit + sigma(q)), so a match is reproducible and diversity comes
+    from the opening book instead. Pass sh_gumbel=True to restore sampling.
+    """
+
+    @staticmethod
+    def gumbel(loc=0.0, scale=1.0, size=None):
+        return np.zeros(() if size is None else size, dtype=np.float64)
+
+
+def _backprop(path, leaf_value_white, leaf_value_white_sh=None):
+    """Accumulate the RAW leaf value into .value and the SHAPED one into
+    .value_sh (same number when shaping is off, and at terminals, which are
+    never shaped). Mirrors training/self_play_batched.py::_backprop.
+
+    The split matters for what each track is allowed to influence. The shaped
+    track steers every quantity that DECIDES something: the PUCT descent, the
+    halving eliminations, the completed Qs behind pi', and the move played.
+    The raw track feeds everything RECORDED -- here the per-decision state
+    statistics -- so the forgiveness numbers reported for an arm are never a
+    statistic of that arm's own bonus."""
+    if leaf_value_white_sh is None:
+        leaf_value_white_sh = leaf_value_white
     for n in path:
         n.visits += 1
         n.value += leaf_value_white * n.moverSign
+        n.value_sh += leaf_value_white_sh * n.moverSign
+
+
+def _fpu_q_sh(node, fpu_reduction):
+    """node_fpu_q against the SHAPED accumulator. Same logic as
+    search.puct.node_fpu_q -- negate for internal nodes, visit-weighted child
+    average at a root (moverSign == 0) -- but reading .value_sh, so an
+    unvisited child is compared on the same track as its siblings."""
+    if node.moverSign != 0 and node.visits > 0:
+        return -(node.value_sh / node.visits) - fpu_reduction
+    vsum = 0.0
+    nsum = 0
+    for ch in node.children:
+        if ch.visits:
+            vsum += ch.value_sh
+            nsum += ch.visits
+    return (vsum / nsum - fpu_reduction) if nsum else 0.0
 
 
 def select_move(visit_counts, temp, rng=None):
@@ -106,12 +201,62 @@ def select_move(visit_counts, temp, rng=None):
 # --------------------------------------------------------------------------- #
 # per-game state
 # --------------------------------------------------------------------------- #
+def select_move_sh(root, sh, temp, rng=None, c_visit=50.0, c_scale=0.02,
+                   shaped=False):
+    """The move to PLAY at a sequential-halving root.
+
+    Visit counts are NOT a ranking under halving -- every survivor of a phase
+    holds the same count by construction, so argmax-by-visits reads the
+    elimination schedule rather than action quality. The ranking is pi', the
+    improved policy softmax(log prior + sigma(qhat)), restricted to the
+    candidates halving left alive (pi' assigns mass to every legal move,
+    including ones eliminated in phase 0 and completed with v_mix, and we do
+    not want to play those).
+
+    shaped=True reads the shaped value track. Under halving this is the ONLY
+    channel by which value shaping reaches the played move: the visit counts
+    are fixed by the schedule, so unlike plain AlphaZero the preference
+    cannot arrive through visit allocation.
+
+    temp <= 0 -> argmax (the acting rule for rated games). temp > 0 -> sample
+    from pi'^(1/temp) over the survivors, for opening diversity when no book
+    is in use. Deterministic given the tree: unlike SHState.select_action this
+    carries no Gumbel term.
+    """
+    if improved_policy is None:
+        return None
+    kw = {}
+    if shaped:
+        try:
+            import inspect
+            if "shaped" in inspect.signature(improved_policy).parameters:
+                kw["shaped"] = True
+        except (TypeError, ValueError):
+            pass
+    probs = improved_policy(root, c_visit=c_visit, c_scale=c_scale, **kw)
+    if not probs:
+        return None
+    if sh is not None and sh.candidates:
+        alive = {c.move for c in sh.candidates}
+        restricted = {m: p for m, p in probs.items() if m in alive}
+        if restricted:
+            probs = restricted
+    moves = list(probs.keys())
+    p = np.array([probs[m] for m in moves], dtype=np.float64)
+    if temp <= 1e-6 or p.sum() <= 0.0:
+        return moves[int(p.argmax())]
+    w = p ** (1.0 / temp)
+    if rng is None:
+        rng = np.random.default_rng()
+    return moves[rng.choice(len(moves), p=w / w.sum())]
+
+
 class _AGame:
     """One arena game. `white`/`black` are each either a net_id (str -> neural,
     searched with that net) or an anchor agent object exposing .select(env, ply)."""
     __slots__ = ("pidx", "a_is_white", "white", "black",
                  "env", "ply", "done", "a_score",
-                 "root", "sims_done", "search_net")
+                 "root", "sims_done", "search_net", "sh")
 
     def __init__(self, pidx, a_is_white, white, black):
         self.pidx = pidx
@@ -126,6 +271,7 @@ class _AGame:
         self.root = None
         self.sims_done = 0
         self.search_net = None
+        self.sh = None                  # SHState for the CURRENT move, or None
 
 
 # --------------------------------------------------------------------------- #
@@ -138,6 +284,9 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                             on_game_done=None, decide_move=None,
                             gumbel_select=False, gumbel_c_visit=50.0,
                             gumbel_c_scale=1.0, gumbel_min_visits=None,
+                            sequential_halving=False, sh_m=16, sh_stat_width=4,
+                            sh_c_visit=50.0, sh_c_scale=0.02, sh_gumbel=False,
+                            sh_seed=0, shape_beta=None,
                             rng=None):
     """
     tickets : list of (pidx, a_is_white, white_mover, black_mover)
@@ -154,9 +303,55 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
               caching / progress).
     decide_move(g, visit_counts) -> move, optional: overrides the default
               move choice (opening temp then argmax-by-visits). g exposes
-              .search_net (the mover's net_id), .env, .ply, .root -- enough for
-              perturbed / forgiveness-aware selection. The callback owns ALL
-              temperature handling, including the opening.
+              .search_net (the mover's net_id), .env, .ply, .root and .sh --
+              enough for perturbed / forgiveness-aware selection. The callback
+              owns ALL temperature handling, including the opening.
+              g.sh is the move's SHState when sequential_halving is on (None
+              otherwise), so a callback can take the matched-variance
+              statistics set with g.sh.stat_children() / g.sh.stat_floor()
+              and the acting rule with select_move_sh(g.root, g.sh, 0.0).
+              Under halving, `visit_counts` encodes the ELIMINATION SCHEDULE,
+              not action quality: do not rank by it.
+    sequential_halving: allocate ROOT visits by Gumbel top-m + sequential
+              halving (search/sequential_halving.py) instead of PUCT, exactly
+              as full-search self-play moves do. Interior nodes stay on PUCT
+              either way. This is what makes root Q estimates comparable
+              ACROSS actions -- PUCT roots concentrate visits, so a
+              second-best child can hold three visits and a Q that is one
+              noisy leaf evaluation. Any statistic that is a function of
+              differences BETWEEN root Qs (an action gap, a Q-entropy, a
+              delta-set membership test) needs this on.
+    sh_m      : root actions considered (top-m by Gumbel-perturbed prior).
+              Capped by the branching factor and by the budget. At small
+              budgets prefer a smaller m: plan_phases(300, 16) gives per
+              candidate 4/13/31/77 across its four phases, while
+              plan_phases(800, 8) gives 33/99/235 -- the second puts the
+              statistics set at 99 visits, near the 108 of the 1000-sim
+              training configuration.
+    sh_stat_width: how many actions to snapshot for the statistics set at
+              each phase advance (default 4). The final pair is too narrow
+              for a Q-entropy -- over two actions it is a monotone function
+              of the action gap. Read the set back with g.sh.stat_children().
+    sh_c_visit / sh_c_scale: the sigma transform in pi' and in the acting
+              rule. Match the training configuration (0.02, not the 1.0
+              default that sigma_scale carries for other callers).
+    sh_gumbel : keep the Gumbel exploration variables (default False -> a
+              deterministic, reproducible arena; see _ZeroGumbel).
+    sh_seed   : seed for the Gumbel draws when sh_gumbel is True.
+    shape_beta: {net_id: beta} -- forgiveness VALUE SHAPING at search time,
+              per player. At each non-terminal leaf the backed-up value
+              becomes clip(v + beta*(2*F-1), -1, 1), with F the net's own
+              forgiveness head on that leaf, mirroring
+              training/self_play_batched.py. This is the same mechanism the
+              shaped checkpoints trained under, so switching it on here
+              evaluates the METHOD; leaving it off evaluates only the policy
+              those checkpoints learned. Per-player because in a head-to-head
+              only one arm should be shaped.
+              Requires eval_fns entries built with return_forgiveness=True
+              for the shaped ids, and a parity-BLENDED head: the bonus is
+              applied symmetrically at both players' leaves, so a _me or _opp
+              head would boost one side's slack and penalise the other's.
+              Terminal values are never shaped.
     gumbel_select: replace the default POST-OPENING argmax-by-visits with
               Gumbel-AlphaZero selection, argmax of
                   log prior + (gumbel_c_visit + max_visits) * gumbel_c_scale * Q
@@ -176,6 +371,70 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
     cache = {} if use_cache else None
     ticket_iter = iter(tickets)
     results = []
+
+    sh_on = bool(sequential_halving)
+    if sh_on and SHState is None:
+        raise ImportError(
+            "sequential_halving=True but search.sequential_halving could not "
+            "be imported -- refusing to fall back to PUCT silently, because "
+            "the difference is invisible in the results and changes what the "
+            "root Q estimates mean.")
+    sh_rng = np.random.default_rng(sh_seed) if sh_gumbel else _ZeroGumbel()
+
+    shape_beta = {k: float(v) for k, v in (shape_beta or {}).items()
+                  if float(v) != 0.0}
+    shaping_on = bool(shape_beta)
+    # Does SHState steer on the shaped track? If not, shaping still reaches
+    # the search through the interior PUCT descent on .value_sh -- which
+    # changes WHICH leaves are visited, so the raw Qs differ too -- but the
+    # root eliminations and pi' read raw values. That is a weaker channel,
+    # not a broken one, and it is what a training run whose
+    # sequential_halving.py also lacked the parameter would have used. Match
+    # training rather than refusing.
+    sh_shaped_ok = False
+    ip_shaped_ok = False
+    if shaping_on:
+        if not sh_on:
+            raise ValueError(
+                "shape_beta needs sequential_halving=True. Under plain PUCT "
+                "the shaped preference would reach the played move only "
+                "through visit allocation, and the arena selects by pi' or "
+                "visit argmax -- the mechanism would be half-connected.")
+        import inspect
+        sh_shaped_ok = ("shaped"
+                        in inspect.signature(SHState.__init__).parameters)
+        ip_shaped_ok = ("shaped"
+                        in inspect.signature(improved_policy).parameters)
+        if not (sh_shaped_ok and ip_shaped_ok):
+            print("=" * 70)
+            print("NOTE: search.sequential_halving does not support shaped=; "
+                  "value shaping will")
+            print("run in INTERIOR-ONLY mode. The PUCT descent below the root "
+                  "steers on the")
+            print("shaped track, but the root eliminations and pi' -- and so "
+                  "the move played --")
+            print("read raw values. Shaping still biases which leaves are "
+                  "visited, so it is a")
+            print("real but weaker channel.")
+            print("")
+            print("This MATCHES training if the run that produced the "
+                  "checkpoint used the same")
+            print("sequential_halving.py. Check with:")
+            print("    grep -n 'shaped' training/self_play_batched.py")
+            print("If training DID pass shaped=, update sequential_halving.py "
+                  "before trusting")
+            print("these numbers -- otherwise evaluation is running a weaker "
+                  "mechanism than")
+            print("the net trained under.")
+            print("=" * 70)
+
+    # per-game simulation budget (an int for everyone, or {net_id: sims})
+    _iters_map = iterations if isinstance(iterations, dict) else None
+    _iters_default = (max(iterations.values()) if _iters_map else iterations)
+
+    def game_budget(g):
+        return (_iters_map.get(g.search_net, _iters_default)
+                if _iters_map else iterations)
 
     def finalize(g):
         r = g.env.result()
@@ -199,6 +458,10 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                 g.root.moverSign = 0
                 g.sims_done = 0
                 g.search_net = mover
+                # Built lazily on the first descent after the root expands
+                # (SHState needs children to sample top-m from). The arena
+                # does not reuse subtrees, so every move starts from scratch.
+                g.sh = None
                 return
             move = mover.select(g.env, g.ply)   # anchor -> instant move
             if move is None:
@@ -239,21 +502,54 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
             node = g.root
             env = g.env.clone()
             path = [node]
+            at_root = True
+            g_shaped = g.search_net in shape_beta
             while node.expanded and not node.terminal and node.children:
-                sqrt_pv = math.sqrt(node.visits)
                 best = None
-                best_score = -1e30
-                fpu_q = node_fpu_q(node, fpu_reduction)
-                for ch in node.children:
-                    v = ch.visits
-                    q = ch.value / v if v else fpu_q
-                    s = q + c * ch.prior * sqrt_pv / (1 + v)
-                    if s > best_score:
-                        best_score = s
-                        best = ch
+                # ---- root: sequential halving decides who gets this visit ----
+                # Interior nodes stay on PUCT, as in training: the root is
+                # where both the played move and the statistics come from, and
+                # replacing the interior selection is a larger change with its
+                # own parameters.
+                if at_root and sh_on:
+                    if g.sh is None:
+                        kw = ({"shaped": True}
+                              if (g_shaped and sh_shaped_ok) else {})
+                        g.sh = SHState(node,
+                                       budget=game_budget(g) - node.visits,
+                                       m=sh_m, rng=sh_rng,
+                                       c_visit=sh_c_visit, c_scale=sh_c_scale,
+                                       stat_width=sh_stat_width, **kw)
+                    best = g.sh.next_child()
+                    # None once the schedule is spent -- PUCT below soaks up
+                    # any residual budget (only happens if the plan underspent).
+                if best is None:
+                    sqrt_pv = math.sqrt(node.visits)
+                    best_score = -1e30
+                    # Descend on whichever track this player's search runs on:
+                    # shaping only steers if the exploitation term reads it.
+                    if g_shaped:
+                        fpu_q = _fpu_q_sh(node, fpu_reduction)
+                        for ch in node.children:
+                            v = ch.visits
+                            q = ch.value_sh / v if v else fpu_q
+                            s = q + c * ch.prior * sqrt_pv / (1 + v)
+                            if s > best_score:
+                                best_score = s
+                                best = ch
+                    else:
+                        fpu_q = node_fpu_q(node, fpu_reduction)
+                        for ch in node.children:
+                            v = ch.visits
+                            q = ch.value / v if v else fpu_q
+                            s = q + c * ch.prior * sqrt_pv / (1 + v)
+                            if s > best_score:
+                                best_score = s
+                                best = ch
                 node = best
                 env.step(node.move)
                 path.append(node)
+                at_root = False
 
             if node.terminal:
                 r = env.result()
@@ -281,9 +577,12 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
                        env.halfmove_clock, env.counts.get(env.board.stateKey(), 1))
                 hit = cache.get(key)
                 if hit is not None:
-                    priors, value = hit
-                    _expand(node, priors, mover)
-                    _backprop(path, value if mover == "white" else -value)
+                    # Cache entries carry BOTH tracks: beta and the net are
+                    # fixed for the whole call, so a hit agrees on both.
+                    priors, value, v_sh = hit
+                    _expand(node, priors, mover, net_value=value)
+                    sgn = 1.0 if mover == "white" else -1.0
+                    _backprop(path, sgn * value, sgn * v_sh)
                     g.sims_done += 1
                     continue
 
@@ -293,28 +592,42 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
         # ---- one batched forward per distinct searching net ----
         for net_id, items in batches.items():
             planes = [encode_env(it[2]) for it in items]
-            logits_b, values_b = eval_fns[net_id](planes)
-            for (g, node, env, legal, path, mover), logits, value in zip(
-                    items, logits_b, values_b):
+            beta = shape_beta.get(net_id, 0.0)
+            out = eval_fns[net_id](planes)
+            if beta:
+                if len(out) != 3:
+                    raise ValueError(
+                        f"shape_beta set for {net_id!r} but its eval_fn "
+                        "returns 2 arrays -- build it with "
+                        "_make_eval_fn(net, return_forgiveness=True)")
+                logits_b, values_b, f_b = out
+                # v' = clip(v + beta*(2F-1), -1, 1), F in the POV of the
+                # player to move at the leaf, exactly as in training.
+                shaped_b = np.clip(
+                    values_b + beta * (2.0 * f_b - 1.0), -1.0, 1.0)
+            else:
+                logits_b, values_b = out[0], out[1]
+                shaped_b = values_b
+            for (g, node, env, legal, path, mover), logits, value, v_sh in zip(
+                    items, logits_b, values_b, shaped_b):
                 idxs = [encodeMovePOV(m, mover) for m in legal]
                 probs = _softmax(np.asarray(logits)[idxs])
                 priors = {m: float(p) for m, p in zip(legal, probs)}
                 value = float(value)
+                v_sh = float(v_sh)
                 if cache is not None and len(cache) < cache_cap:
                     cache[(net_id, env.board.stateKey(), env.halfmove_clock,
-                           env.counts.get(env.board.stateKey(), 1))] = (priors, value)
-                _expand(node, priors, mover)
-                _backprop(path, value if mover == "white" else -value)
+                           env.counts.get(env.board.stateKey(), 1))] = (
+                        priors, value, v_sh)
+                _expand(node, priors, mover, net_value=value)
+                sgn = 1.0 if mover == "white" else -1.0
+                _backprop(path, sgn * value, sgn * v_sh)
                 g.sims_done += 1
 
         # ---- games whose search is complete pick a move; refill the pool ----
         still = []
-        _iters_map = iterations if isinstance(iterations, dict) else None
-        _iters_default = (max(iterations.values()) if _iters_map
-                          else iterations)
         for g in active:
-            g_iters = (_iters_map.get(g.search_net, _iters_default)
-                       if _iters_map else iterations)
+            g_iters = game_budget(g)
             if g.sims_done < g_iters:
                 still.append(g)
                 continue
@@ -324,6 +637,18 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
             else:
                 if decide_move is not None:
                     move = decide_move(g, visit_counts)
+                elif sh_on:
+                    # pi' over the survivors, NOT argmax visits (see
+                    # select_move_sh). Opening plies still get a temperature,
+                    # applied to pi' rather than to the halving schedule.
+                    move = select_move_sh(
+                        g.root, g.sh,
+                        opening_temp if g.ply < opening_plies else 0.0,
+                        rng, c_visit=sh_c_visit, c_scale=sh_c_scale,
+                        shaped=(ip_shaped_ok
+                                and g.search_net in shape_beta))
+                    if move is None:
+                        move = select_move(visit_counts, 0.0, rng)
                 elif gumbel_select and g.ply >= opening_plies:
                     move = select_move_gumbel(
                         g.root, temp=0.0, rng=rng,
@@ -357,7 +682,13 @@ def run_elo_matches_batched(tickets, eval_fns, *, iterations=400, c=1.5,
 # --------------------------------------------------------------------------- #
 # torch evaluator (lazy import)
 # --------------------------------------------------------------------------- #
-def _make_eval_fn(net):
+def _make_eval_fn(net, return_forgiveness=False):
+    """planes list -> (logits, values), or (logits, values, forgiveness) when
+    return_forgiveness=True.
+
+    The third output costs nothing extra: the forgiveness head hangs off the
+    same trunk, so net(x, return_forgiveness=True) is ONE forward returning
+    all three. Value shaping therefore adds no network calls to the search."""
     import torch
     device = next(net.parameters()).device
     use_amp = (device.type == "cuda")
@@ -368,9 +699,17 @@ def _make_eval_fn(net):
         with torch.no_grad():
             if use_amp:
                 with torch.autocast("cuda"):
-                    policy_logits, value = net(x)
+                    out = net(x, return_forgiveness=True) \
+                        if return_forgiveness else net(x)
             else:
-                policy_logits, value = net(x)
+                out = net(x, return_forgiveness=True) \
+                    if return_forgiveness else net(x)
+        if return_forgiveness:
+            policy_logits, value, f = out
+            return (policy_logits.float().cpu().numpy(),
+                    value.float().cpu().numpy().reshape(-1),
+                    f.float().cpu().numpy().reshape(-1))
+        policy_logits, value = out
         return (policy_logits.float().cpu().numpy(),
                 value.float().cpu().numpy().reshape(-1))
 
@@ -401,9 +740,13 @@ def _build_tickets(pairings, games, mover_for, seed_base):
 def _run_pairings(pairings, games, eval_fns, mover_for, on_pairing, *,
                   iterations, c, opening_plies, opening_temp, max_plies,
                   concurrency, use_cache, cache_cap, seed_base,
-                  on_each_game=None):
+                  on_each_game=None, sh=None):
     """Play every game of `pairings` with the batched runner, aggregate per
-    pairing, and call on_pairing(a, b, w, d, l, n) as each pairing completes."""
+    pairing, and call on_pairing(a, b, w, d, l, n) as each pairing completes.
+
+    `sh`: optional dict of sequential-halving kwargs for the runner
+    (sequential_halving / sh_m / sh_stat_width / sh_c_visit / sh_c_scale /
+    sh_gumbel / sh_seed), passed straight through."""
     names = {gpidx: (a, b) for (gpidx, a, b) in pairings}
     agg = {gpidx: {"w": 0, "d": 0, "l": 0, "n": 0} for (gpidx, a, b) in pairings}
     received = {gpidx: 0 for (gpidx, a, b) in pairings}
@@ -432,6 +775,7 @@ def _run_pairings(pairings, games, eval_fns, mover_for, on_pairing, *,
         max_plies=max_plies, concurrency=concurrency,
         use_cache=use_cache, cache_cap=cache_cap,
         on_game_done=on_game_done,
+        **(sh or {}),
     )
 
 
@@ -476,6 +820,7 @@ def _elo_worker(pairings, spec, games, cfg, seed_base, result_queue):
             max_plies=cfg["max_plies"], concurrency=cfg["concurrency"],
             use_cache=cfg["use_cache"], cache_cap=cfg["cache_cap"],
             seed_base=seed_base, on_each_game=on_each_game,
+            sh=cfg.get("sh"),
         )
     finally:
         result_queue.put(("worker_done",))
@@ -610,6 +955,24 @@ def main():
     ap.add_argument("--last-iters", type=int, default=0,
                     help="only score checkpoints within this many iterations of "
                          "the final one (0 = all). Applied before --every-iters/--stride.")
+    ap.add_argument("--sequential-halving", action="store_true",
+                    help="allocate ROOT visits by Gumbel top-m + sequential "
+                         "halving instead of PUCT, as full-search self-play "
+                         "moves do, and play the pi' argmax rather than the "
+                         "visit argmax. Required for any measurement that "
+                         "compares root Q values across actions.")
+    ap.add_argument("--sh-m", type=int, default=16,
+                    help="root actions considered (top-m). At small budgets "
+                         "prefer 8: plan_phases(800, 8) puts the statistics "
+                         "set at 99 visits vs 31 for (300, 16).")
+    ap.add_argument("--sh-stat-width", type=int, default=4,
+                    help="actions snapshotted for the statistics set")
+    ap.add_argument("--sh-c-visit", type=float, default=50.0)
+    ap.add_argument("--sh-c-scale", type=float, default=0.02,
+                    help="match the training config (0.02)")
+    ap.add_argument("--sh-gumbel", action="store_true",
+                    help="keep the Gumbel exploration draws (default off: "
+                         "deterministic, reproducible rated games)")
     ap.add_argument("--round-robin", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--cache-cap", type=int, default=250_000)
@@ -702,7 +1065,12 @@ def main():
                    opening_plies=args.opening_plies, opening_temp=args.opening_temp,
                    max_plies=args.max_plies, concurrency=args.concurrency,
                    use_cache=not args.no_cache, cache_cap=args.cache_cap,
-                   device=str(device))
+                   device=str(device),
+                   sh=dict(sequential_halving=args.sequential_halving,
+                           sh_m=args.sh_m, sh_stat_width=args.sh_stat_width,
+                           sh_c_visit=args.sh_c_visit,
+                           sh_c_scale=args.sh_c_scale,
+                           sh_gumbel=args.sh_gumbel, sh_seed=args.seed))
 
         if args.workers <= 1:
             # ---- single process ----
@@ -732,7 +1100,8 @@ def main():
                           opening_plies=cfg["opening_plies"], opening_temp=cfg["opening_temp"],
                           max_plies=cfg["max_plies"], concurrency=cfg["concurrency"],
                           use_cache=cfg["use_cache"], cache_cap=cfg["cache_cap"],
-                          seed_base=args.seed, on_each_game=on_each)
+                          seed_base=args.seed, on_each_game=on_each,
+                          sh=cfg["sh"])
             print()
         else:
             # ---- multi process: contiguous pairing chunks, each worker self-contained ----

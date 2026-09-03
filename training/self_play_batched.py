@@ -343,14 +343,22 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     absorb the preference: this is the training-time mechanism, in contrast
     to post-search selection. Terminal values are never shaped.
 
-    DUAL-TRACK VALUES: the shaped value steers ONLY the PUCT descent
-    (Node.value_sh). Every recorded quantity -- value targets, forgiveness
-    labels, move-selection Qs, root values -- reads the RAW accumulator
-    (Node.value), so the labels the head trains on are statistics of TRUE
-    values rather than of the head's own bonus (no self-referential
-    feedback), and the value targets carry no shaping bias. Shaping reaches
-    the policy exclusively through visit allocation -- exactly the
-    policy-target channel. Use beta ~ typical Q gap (0.02-0.05).
+    DUAL-TRACK VALUES: the shaped accumulator (Node.value_sh) steers every
+    quantity that DECIDES something -- the PUCT descent, the sequential-halving
+    eliminations, the completed Qs behind pi', and the move actually played.
+    The raw accumulator (Node.value) feeds every quantity that is RECORDED as
+    a supervision signal -- value targets and forgiveness labels -- so the head
+    never trains on a statistic of its own bonus (no self-referential feedback)
+    and the value targets carry no shaping bias.
+
+    Under plain AlphaZero the preference reached the trained policy through
+    visit allocation, because the visit counts WERE the target. Halving fixes
+    the allocation by schedule, so that channel is closed: the preference now
+    reaches the policy through pi', whose completed Qs read the shaped track
+    (see search/sequential_halving.py::_node_value). With shaping off, both
+    tracks hold the same numbers and the search is bit-identical to before.
+    Use beta ~ typical Q gap (0.02-0.05); an order of magnitude below that and
+    it cannot displace a single elimination.
 
     FORGIVING MOVE SELECTION (forgiving_select, default off): on POST-OPENING
     (ply >= temp_moves) full-search moves, form the near-optimal set
@@ -477,6 +485,13 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
     # corrupt the target rather than fail, so they are forced off here and the
     # override is announced.
     sh_on = bool(sequential_halving)
+    # Shaping is only a real treatment if the ROOT decisions see it. Under
+    # halving the allocation is fixed by schedule, so unless the eliminations,
+    # the completed Qs and pi' read Node.value_sh, beta cannot influence which
+    # move is played or what the policy target says -- it would only bias which
+    # continuations get sampled below the root. Forgiveness LABELS and VALUE
+    # targets stay on the raw accumulator regardless.
+    sh_shaped = bool(forgiveness_shaping_beta > 0.0)
     if sh_on:
         if full_force_m > 0 and verbose:
             print(f"  [sequential_halving] root_force_m/forgiveness_force_m "
@@ -582,12 +597,13 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                     # halving -- they encode the elimination schedule, not
                     # action quality (see search/sequential_halving.py).
                     policy_target = _policy_target_from_probs(
-                        improved_policy(root, sh_c_visit, sh_c_scale), mover)
+                        improved_policy(root, sh_c_visit, sh_c_scale,
+                                        shaped=sh_shaped), mover)
                 else:
                     policy_target = _policy_target_sparse(visit_counts, mover)
                 # Which root Qs are trustworthy: the forced floor normally, the
                 # surviving candidates' minimum visit count under halving.
-                stat_floor = (g.sh.final_floor()
+                stat_floor = (g.sh.stat_floor()
                               if (sh_on and g.sh is not None) else g.force_n)
                 if forgiveness_targets:
                     forgiveness_t, forgiveness_m = forgiveness_target(root, stat_floor, forgiveness_tau,
@@ -718,7 +734,8 @@ def run_selfplay(eval_fn, num_games, *, iterations=400, concurrency=64,
                         # and are credited by SHState (see its docstring).
                         g.sh = SHState(node, budget=g.move_cap - node.visits,
                                        m=sh_m, rng=rng,
-                                       c_visit=sh_c_visit, c_scale=sh_c_scale)
+                                       c_visit=sh_c_visit, c_scale=sh_c_scale,
+                                       shaped=sh_shaped)
                     best = g.sh.next_child()
                     # best is None once the schedule is spent -> plain PUCT
                     # soaks up any residual budget below.

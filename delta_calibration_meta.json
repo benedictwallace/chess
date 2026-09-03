@@ -1,0 +1,21 @@
+{
+  "checkpoint": "/home/uceebah/chess/checkpoints_baseline_ext/net_iter13100.pt",
+  "sims": 800,
+  "sims_hi": 5000,
+  "sh_m": 8,
+  "sh_stat_width": 4,
+  "sh_gumbel": false,
+  "median_stat_floor": 99,
+  "positions": 395,
+  "gap_percentiles": {
+    "5": 4.434403384270258e-05,
+    "10": 0.00016393667681005033,
+    "25": 0.002358512705829763,
+    "50": 0.01967706992370516,
+    "75": 0.08153828443918262,
+    "90": 0.1739827635724323,
+    "95": 0.27863410337800715
+  },
+  "noise_rms": 0.06453668176786186,
+  "argmax_flip_rate": 0.3493670886075949
+}

@@ -285,21 +285,60 @@ def train_epoch(net, buffer, optimiser, device, batches=32, batch_size=128,
                     e_se += (w * (p - t) ** 2).sum().item()
 
         if decoupled:
-            # ---- step 1: trunk + policy + value (forgiveness graph untouched) ----
-            scaler.scale(loss_pv).backward()
+            # ---- ONE backward over a summed loss, then step both optimisers ----
+            #
+            # This used to be two separate .backward() calls, one per optimiser.
+            # That is mathematically the same thing here but CRASHES under
+            # torch.compile:
+            #
+            #     RuntimeError: Trying to backward through the graph a second
+            #     time ... saved intermediate values ... have already been freed
+            #
+            # AOT autograd compiles the whole forward into ONE graph and frees
+            # its saved tensors when the first backward completes, so the second
+            # call finds nothing left. It does not matter that the two
+            # subgraphs are logically disjoint -- the compiled region is a
+            # single unit as far as the autograd engine is concerned. Eager
+            # mode happened to tolerate the pattern, which is why this only
+            # surfaced once torch.compile was switched on AND
+            # forgiveness_targets became True (the second backward never ran
+            # while aux_forgiveness was off).
+            #
+            # Summing is EXACT, not an approximation, because `decoupled` is
+            # only true when the head reads DETACHED trunk features:
+            #   d(forgiveness_loss)/d(trunk, policy, value params) == 0
+            #       -- the detach severs it
+            #   d(loss_pv)/d(forgiveness params)             == 0
+            #       -- the forgiveness head is not on the policy/value path
+            # so each parameter group receives precisely the gradient it
+            # received before. The two optimisers still hold disjoint parameter
+            # sets and still step with their own learning rates; only the
+            # number of graph traversals changed. (retain_graph=True would also
+            # work, but it keeps the entire forward's activations alive for a
+            # second pass -- real memory for no benefit.)
+            #
+            # The empty-batch guard is preserved: when a batch carries no
+            # forgiveness-labelled rows the masked loss is 0 with zero gradient,
+            # but AdamW's weight_decay plus stale momentum would still shrink
+            # the head on every such batch -- a slow drift toward the origin
+            # driven by nothing. So the head's optimiser is only stepped when
+            # there is something to learn from, and the loss term is only
+            # summed in when it is live.
+            have_forgiveness = emask.sum().item() > 0
+            total = loss_pv
+            if have_forgiveness:
+                total = total + forgiveness_weight * forgiveness_loss
+
+            scaler.scale(total).backward()
             scaler.step(optimiser)
+            if have_forgiveness:
+                eopt = (forgiveness_optimiser if forgiveness_optimiser is not None
+                        else optimiser)
+                if eopt is not optimiser:
+                    scaler.step(eopt)
             scaler.update()
-            # ---- step 2: forgiveness head only, its own optimiser. SKIPPED
-            # when the batch has no forgiveness-labelled rows: the masked loss
-            # is 0 with zero gradient, but Adam's weight_decay (plus stale
-            # momentum) would still shrink the head a little on every empty
-            # batch -- a slow drift toward the origin driven by nothing. ----
-            if emask.sum().item() > 0:
-                eopt = forgiveness_optimiser if forgiveness_optimiser is not None else optimiser
-                scaler.scale(forgiveness_weight * forgiveness_loss).backward()
-                scaler.step(eopt)
-                scaler.update()
-            loss = loss_pv + forgiveness_weight * forgiveness_loss    # combined, logging only
+
+            loss = loss_pv + forgiveness_weight * forgiveness_loss    # logging only
         else:
             loss = loss_pv
             if aux_forgiveness:

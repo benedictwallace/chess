@@ -361,13 +361,25 @@ def child_forgiveness(child, tau, gamma=0.85, stat="gap", agg="tree",
 
 def select_move_forgiving(root, delta, tau, *, floor=0, gamma=0.85,
                           stat="gap", agg="tree", parity=1, min_kids=2,
-                          score_children=None, return_info=False):
+                          score_children=None, candidates=None,
+                          return_info=False):
     """Delta-constrained forgiveness selection at a finished root:
 
-        1. CANDIDATES: children with visits >= floor (floor > 0, i.e. a
-           forced-visit root -- matched-variance Qs) or all visited children
-           (floor == 0). Fewer than 2 candidates -> play the most-visited /
-           only child (nothing to compare).
+        1. CANDIDATES: `candidates` when given (an explicit node list --
+           pass SHState.stat_children(), the actions halving kept alive at
+           the last phase advance, which are matched in visits by
+           construction); otherwise children with visits >= floor (floor > 0,
+           i.e. a forced-visit root) or all visited children (floor == 0).
+           Fewer than 2 candidates -> play the most-visited / only child
+           (nothing to compare).
+
+           PREFER THE EXPLICIT SET over a floor. A floor is a visit
+           threshold, so under subtree reuse a child that was never a
+           candidate this move can arrive carrying enough inherited visits to
+           clear it; and on an UNFORCED root (plain PUCT) floor=0 admits
+           one-visit children whose Q is a single leaf evaluation -- with a
+           delta of 0.05 against a per-child standard error several times
+           that, the near-optimal set is then populated by noise.
         2. NEAR-OPTIMAL SET: S = { a : Q1 - Q(a) <= delta }, chooser-POV,
            Q1 the best candidate Q. Every member costs at most delta of
            value per move -- delta IS the return-vs-robustness knob, in the
@@ -391,7 +403,10 @@ def select_move_forgiving(root, delta, tau, *, floor=0, gamma=0.85,
     (True when forgiveness overrode the Q-argmax) -- log these: the
     fraction of switched moves and the realised Q sacrifice are the first
     numbers a report on this selector needs."""
-    qual = _qualified(root, min_kids, floor)
+    if candidates is not None:
+        qual = [c for c in candidates if c.visits > 0]
+    else:
+        qual = _qualified(root, min_kids, floor)
     if len(qual) < 2:
         qual = [c for c in root.children if c.visits > 0]
     if not qual:
@@ -436,9 +451,11 @@ def make_forgiving_decide_move(delta, tau, *, gamma=0.85, stat="gap",
     select_move_forgiving(g.root, delta, tau, ...). `log`, if given, is a
     list that receives each post-opening move's info dict (plus ply and
     net) -- switched-rate and Q-sacrifice per model come straight off it.
-    NOTE: arena searches carry no forced-visit floor, so floor=0 compares
-    all visited children; pass a positive floor only for roots searched
-    under forcing."""
+    NOTE: when the runner is in sequential-halving mode this takes the
+    candidate set from g.sh.stat_children() automatically. On a plain PUCT
+    root there is no forced floor, so floor=0 compares all visited children
+    -- including one-visit ones; see select_move_forgiving's docstring for
+    why that makes the delta-set unreliable."""
     if rng is None:
         rng = np.random.default_rng()
 
@@ -451,9 +468,12 @@ def make_forgiving_decide_move(delta, tau, *, gamma=0.85, stat="gap",
                 w = counts ** (1.0 / opening_temp)
                 return moves[rng.choice(len(moves), p=w / w.sum())]
             return moves[0]
+        sh = getattr(g, "sh", None)
+        cands = sh.stat_children() if sh is not None else None
         move, info = select_move_forgiving(
             g.root, delta, tau, floor=floor, gamma=gamma, stat=stat,
-            agg=agg, parity=parity, min_kids=min_kids, return_info=True)
+            agg=agg, parity=parity, min_kids=min_kids, candidates=cands,
+            return_info=True)
         if log is not None:
             info["ply"] = g.ply
             info["net"] = getattr(g, "search_net", None)

@@ -289,7 +289,41 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
           f"min_buffer {min_buffer}; target replay ratio "
           f"{'off' if target_ratio == 0 else target_ratio}")
 
+    # ---- GPU math knobs (main.py sets cudnn.benchmark; these were missing
+    # from BOTH runners) ----
+    # TF32 on the Ampere+ tensor cores for fp32 matmul/conv. The value head's
+    # Linear layers and every conv fall back to fp32 outside the autocast
+    # region; TF32 keeps ~10 bits of mantissa, which is far more than a value
+    # in [-1, 1] or a policy logit needs.
+    if learner_device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+
     net = ChessNet(channels=cfg["channels"], num_blocks=cfg["num_blocks"]).to(learner_device)
+    # channels_last: an 8x8 conv stack under AMP hits cuDNN's NHWC kernels,
+    # which are the ones with tensor-core paths. Weights and inputs must agree,
+    # so the input is converted in train_epoch's collate via .contiguous(...)
+    # -- or, harmlessly, cuDNN inserts the transpose itself.
+    if learner_device.type == "cuda":
+        net = net.to(memory_format=torch.channels_last)
+
+    # torch.compile the LEARNER only. main.py compiles; this runner never did,
+    # which left the learner slower than the synchronous path for no reason.
+    # Actors are separate processes with their own (uncompiled) copies -- their
+    # batch shape varies as games drain, so compiling them would recapture
+    # constantly. Default mode, NOT reduce-overhead: cudagraphs need a static
+    # shape and a stable train/eval mode, and we toggle both.
+    if cfg.get("compile_learner", True) and learner_device.type == "cuda":
+        try:
+            net = torch.compile(net)
+            print("  learner compiled (torch.compile, default mode)")
+        except Exception as e:
+            print(f"  note: torch.compile unavailable ({e}); running eager")
     # disjoint optimisers -> fully decoupled gradient steps (see train_epoch)
     main_params = [p for n, p in net.named_parameters() if "forgiveness_" not in n]
     forgiveness_params = [p for n, p in net.named_parameters() if "forgiveness_" in n]
@@ -332,14 +366,63 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
     # resume (checkpoints are saved with clean, uncompiled keys)
     latest = os.path.join(cfg["checkpoint_dir"], "latest.pt")
     step = 0
-    if os.path.exists(latest):
+    # cfg["resume"] is honoured here exactly as in main.py. It previously was
+    # not: this runner resumed whenever latest.pt existed, so setting
+    # resume=False to start a clean arm silently continued the old run instead
+    # -- the kind of failure that only shows up as "why is my fresh run already
+    # at 1000 Elo".
+    if cfg.get("resume", True) and os.path.exists(latest):
         ck = torch.load(latest, map_location=learner_device, weights_only=False)
-        missing, unexpected = net.load_state_dict(ck["model_state"],
-                                                  strict=False)
+
+        # LOAD INTO THE UNDERLYING MODULE, not the torch.compile wrapper.
+        # Every save site above uses getattr(net, "_orig_mod", net).state_dict(),
+        # so checkpoints hold CLEAN keys ("stem.0.weight"). A compiled `net`
+        # expects "_orig_mod.stem.0.weight", so loading into the wrapper matched
+        # nothing -- and because strict=False, it did so SILENTLY: 110 of 130
+        # tensors were left at their random init while the step counter resumed
+        # from the checkpoint, so the run looked like a resume and was in fact
+        # training from scratch. Loading into the same object the saves come
+        # from makes the two sides symmetric by construction.
+        target = getattr(net, "_orig_mod", net)
+
+        # Belt and braces: normalise the prefix either way, so a checkpoint
+        # written by a version that DID save wrapper keys still loads.
+        sd = ck["model_state"]
+        _P = "_orig_mod."
+        want_p = next(iter(target.state_dict())).startswith(_P)
+        have_p = next(iter(sd)).startswith(_P)
+        if want_p and not have_p:
+            sd = {_P + k: v for k, v in sd.items()}
+        elif have_p and not want_p:
+            sd = {k[len(_P):]: v for k, v in sd.items()}
+
+        missing, unexpected = target.load_state_dict(sd, strict=False)
+
+        # FAIL LOUDLY. The old message called a 110-key miss "expected" and
+        # reassured that the backbone was loaded -- while naming
+        # _orig_mod.stem.0.weight, the first conv of that very backbone, as
+        # missing. A resume that silently discards the model is worse than a
+        # crash: it costs a full run before anyone notices.
+        n_total = len(target.state_dict())
+        if len(missing) > 20:
+            raise SystemExit(
+                f"RESUME FAILED: {len(missing)}/{n_total} parameters were not "
+                f"found in {latest} (e.g. {missing[0]}).\n"
+                f"  Refusing to train from scratch while reporting a resumed "
+                f"step count.\n"
+                f"  checkpoint key sample: {list(ck['model_state'])[:2]}\n"
+                f"  model key sample     : {list(target.state_dict())[:2]}\n"
+                f"  If the architecture genuinely changed, start a fresh run "
+                f"(resume=False) instead.")
+        if unexpected:
+            print(f"  note: {len(unexpected)} keys in the checkpoint are not in "
+                  f"the model (e.g. {unexpected[0]}) -- architecture drift.")
         if missing:
-            print(f"  note: {len(missing)} params freshly initialised "
-                  f"(e.g. {missing[0]}) -- expected when resuming a "
-                  f"pre-forgiveness-head checkpoint; the backbone is loaded.")
+            print(f"  note: {len(missing)}/{n_total} params freshly initialised "
+                  f"(e.g. {missing[0]}) -- expected only when adding a NEW head "
+                  f"to an existing backbone.")
+        else:
+            print(f"  all {n_total} parameters loaded from {latest}")
         try:
             if "optim_state" in ck:
                 optimiser.load_state_dict(ck["optim_state"])
@@ -351,7 +434,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
         step = ck.get("train_step", ck.get("iteration", 0) * cfg["train_batches"])
         print(f"resumed at train_step {step}")
 
-    _atomic_torch_save({"model_state": net.state_dict()}, pub_path)  # before actors
+    _atomic_torch_save({"model_state": getattr(net, "_orig_mod", net).state_dict()}, pub_path)  # before actors
 
     # metrics
     # policy_kl = loss_policy - target_entropy. CE = H(target) + KL, and only
@@ -449,7 +532,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
             step += train_block
 
             if step - last_publish >= publish_every_steps:
-                _atomic_torch_save({"model_state": net.state_dict()}, pub_path)
+                _atomic_torch_save({"model_state": getattr(net, "_orig_mod", net).state_dict()}, pub_path)
                 last_publish = step
                 it = step // cfg["train_batches"]
                 ratio = ((step - start_step) * cfg["batch_size"]
@@ -478,7 +561,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
             if step - last_ckpt >= checkpoint_every_steps:
                 it = step // cfg["train_batches"]
                 ckpt = {"iteration": it, "train_step": step,
-                        "model_state": net.state_dict(),
+                        "model_state": getattr(net, "_orig_mod", net).state_dict(),
                         "optim_state": optimiser.state_dict(),
                         "forgiveness_optim_state": forgiveness_optimiser.state_dict(),
                         "config": cfg}
@@ -498,7 +581,7 @@ def main(cfg=None, gpus=None, actors_per_gpu=2, dedicate_learner_gpu=False,
                 p.terminate()
         it = step // cfg["train_batches"]
         ckpt = {"iteration": it, "train_step": step,
-                "model_state": net.state_dict(),
+                "model_state": getattr(net, "_orig_mod", net).state_dict(),
                 "optim_state": optimiser.state_dict(),
                 "forgiveness_optim_state": forgiveness_optimiser.state_dict(),
                 "config": cfg}
@@ -552,5 +635,6 @@ if __name__ == "__main__":
          train_block=args.train_block, games_per_chunk=args.games_per_chunk,
          total_train_steps=args.total_train_steps,
          target_ratio=args.target_ratio, min_buffer=args.min_buffer)
+
 
     
